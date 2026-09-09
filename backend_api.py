@@ -1,0 +1,916 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from urllib.parse import quote_plus
+
+from agent_orchestrator import AgentOrchestrator, ConfirmationRequiredError
+from backend_agent_registry import is_known_agent
+from csv_analyst_agent import run_csv_analyst
+from excel_analyst_agent import run_excel_analyst
+from sql_analyst_agent import run_sql_analyst
+from financial_data_analyst import run_financial_analyst
+from payroll_analyst import run_payroll_analyst
+from sales_pipeline_analyst import run_sales_pipeline_analyst
+from json_analyst_agent import run_json_analyst
+from churn_analyzer_agent import run_churn_analyzer
+from attendance_analyzer_agent import run_attendance_analyzer
+from word_analyst_agent import run_word_analyst
+from ppt_analyst_agent import run_ppt_analyst
+from email_analyzer_agent import run_email_analyzer
+from transcript_analyzer_agent import run_transcript_analyzer
+from invoice_processor_agent import run_invoice_processor
+from recruitment_analyst_agent import run_recruitment_analyst
+from performance_review_analyzer import run_performance_review_analyzer
+from budget_actuals_analyzer import run_budget_actuals_analyzer
+from expense_auditor_agent import run_expense_auditor
+from ar_aging_analyzer import run_ar_aging_analyzer
+from cashflow_forecast_analyzer import run_cashflow_forecast_analyzer
+from vendor_spend_analyzer import run_vendor_spend_analyzer
+from payment_optimizer_agent import run_payment_optimizer
+from project_timeline_analyzer import run_project_timeline_analyzer
+from sla_compliance_analyzer import run_sla_compliance_analyzer
+from inventory_analyst_agent import run_inventory_analyst
+from supply_chain_analyzer import run_supply_chain_analyzer
+from leads_analyzer_agent import run_leads_analyzer
+from campaign_performance_analyzer import run_campaign_performance_analyzer
+from survey_analyzer_agent import run_survey_analyzer
+from access_rights_analyzer import run_access_rights_analyzer
+from license_tracker_analyzer import run_license_tracker_analyzer
+from incident_analyzer_agent import run_incident_analyzer
+from ml_modeler_agent import run_ml_modeler
+from log_analyst_agent import run_log_analyst
+from image_processor_agent import run_image_processor
+from pdf_extractor_agent import run_pdf_extractor
+from timeseries_forecaster_agent import run_timeseries_forecaster
+from multifile_correlation_analyzer import run_multifile_correlation_analyzer
+from data_quality_analyzer import run_data_quality_analyzer
+from langchain_agent import LangChainAgentExecutor
+from report_builder import CodeBlock, ReportSection, ReportResult as BuiltReportResult
+from fastapi.responses import StreamingResponse
+from tools import ToolCredentialStore
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def serialize_datetime_objects(obj: Any) -> Any:
+    """Recursively convert datetime objects to ISO format strings for JSON serialization."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: serialize_datetime_objects(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [serialize_datetime_objects(item) for item in obj]
+    return obj
+
+
+class QueryRequest(BaseModel):
+    prompt: str
+    top_k: Optional[int] = 5
+    filters: Optional[Dict[str, str]] = None
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    query: str
+    chunks: List[Dict[str, Any]]
+
+
+class UploadResponse(BaseModel):
+    ingested: List[Dict[str, Any]]
+
+
+class PlanRequest(BaseModel):
+    goal: str
+    top_k: Optional[int] = 5
+
+
+class PlanPreviewResponse(BaseModel):
+    goal: str
+    planned_tools: List[str]
+    irreversible_tools: List[str]
+    needs_confirmation: bool
+    chunk_count: int
+
+
+class ExecutePlanRequest(BaseModel):
+    goal: str
+    top_k: Optional[int] = 5
+    confirm: bool = False
+
+
+class PlanExecutionResponse(BaseModel):
+    answer: str
+    steps: List[Dict[str, Any]]
+    partial: bool
+    goal_achieved: Optional[bool]
+    total_duration_ms: Optional[int]
+
+
+class ReportRequest(BaseModel):
+    goal: str
+    query: Optional[str] = None
+    top_k: Optional[int] = 5
+
+
+class ReportResponse(BaseModel):
+    goal: str
+    sections: List[Dict[str, Any]]
+    pending_code_blocks: List[Dict[str, Any]]
+    html: Optional[str]
+    ready_to_finalize: bool
+
+
+class DocumentAssetResponse(BaseModel):
+    doc_id: str
+    filename: str
+    category: str
+    chunk_count: int
+    ingested_at: str
+    metadata: Dict[str, Any]
+    _supabase_synced: bool
+
+
+class StatusResponse(BaseModel):
+    llm: Dict[str, Any]
+    rag: Dict[str, Any]
+    memory: Dict[str, Any]
+    tools: Any
+    documents: Dict[str, Any]
+
+
+class ToolCredentialsRequest(BaseModel):
+    credentials: Dict[str, str]
+
+
+class AgentExecutionRequest(BaseModel):
+    agent_id: str
+    prompt: str
+    mode: Optional[str] = "auto"
+    use_langchain: bool = True
+    table_csv: Optional[str] = None
+    table_json: Optional[List[Dict[str, Any]]] = None
+    file_path: Optional[str] = None
+    db_file: Optional[str] = None
+    top_k: Optional[int] = 5
+    confirm: bool = False
+
+
+class AgentExecutionResponse(BaseModel):
+    agent_id: str
+    mode: str
+    answer: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+def create_agent() -> AgentOrchestrator:
+    config = dict(os.environ)
+    config["llm_provider"] = os.environ.get("LLM_PROVIDER", "deepseek")
+    config["model"] = os.environ.get("DEEPSEEK_MODEL", os.environ.get("LLM_MODEL", "deepseek-chat"))
+    config["session_id"] = os.environ.get("SESSION_ID", "backend_api")
+    return AgentOrchestrator(config=config)
+
+
+app = FastAPI(title="Microfinance Worker Agent API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+agent = create_agent()
+langchain_executor = LangChainAgentExecutor(config=dict(os.environ))
+
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query_agent(payload: QueryRequest) -> QueryResponse:
+    if not payload.prompt or not payload.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    result = agent.query(payload.prompt, top_k=payload.top_k, filters=payload.filters)
+    return {
+        "answer": result.answer,
+        "query": result.query,
+        "chunks": [chunk.to_dict() for chunk in result.chunks],
+    }
+
+
+@app.post("/agent/run", response_model=AgentExecutionResponse)
+async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
+    if not payload.agent_id or not payload.agent_id.strip():
+        raise HTTPException(status_code=400, detail="agent_id is required.")
+    if not is_known_agent(payload.agent_id):
+        raise HTTPException(status_code=400, detail=f"Unknown agent_id: {payload.agent_id}")
+    if not payload.prompt or not payload.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required.")
+
+    answer = ""
+    metadata: Dict[str, Any] = {
+        "agent_id": payload.agent_id,
+        "mode": payload.mode,
+    }
+
+    try:
+        if payload.agent_id == "csv-analyst":
+            if not payload.table_csv:
+                raise HTTPException(status_code=400, detail="CSV data is required for csv-analyst.")
+            csv_result = run_csv_analyst(payload.table_csv, payload.prompt)
+            answer = csv_result.get("answer", "")
+            metadata.update({
+                "source": "csv_analyst",
+                "chart_created": csv_result.get("chart_created", False),
+                "chart_png_base64": csv_result.get("chart_png_base64"),
+            })
+        elif payload.agent_id == "sql-analyst":
+            # sql-analyst supports table JSON or an uploaded DB file path.
+            if payload.db_file:
+                db_path = payload.db_file
+                if not os.path.isabs(db_path):
+                    db_path = str(UPLOAD_DIR / db_path)
+                if not Path(db_path).exists():
+                    raise HTTPException(status_code=400, detail=f"Database file not found: {payload.db_file}")
+                sql_result = run_sql_analyst(db_path, None, None, payload.prompt)
+                answer = sql_result.get("answer", json.dumps(sql_result))
+                metadata.update({"source": "sql_analyst_db", "db_file": db_path})
+            elif payload.table_json is not None:
+                sql_result = run_sql_analyst(None, None, payload.table_json, payload.prompt)
+                answer = sql_result.get("answer", json.dumps(sql_result))
+                metadata["source"] = "sql_analyst_json"
+            else:
+                raise HTTPException(status_code=400, detail="sql-analyst requires table_json input or an uploaded DB file.")
+        elif payload.agent_id == "excel-analyst":
+            if payload.table_json is not None:
+                excel_result = run_excel_analyst(None, payload.table_json, payload.prompt)
+                answer = json.dumps(excel_result)
+                metadata["source"] = "excel_analyst_json"
+            else:
+                raise HTTPException(status_code=400, detail="excel-analyst requires table_json input or an uploaded Excel file.")
+        elif payload.agent_id == "financial-data":
+            if payload.table_csv:
+                fin_result = run_financial_analyst(payload.table_csv, None, payload.prompt)
+                answer = fin_result.get("answer", json.dumps(fin_result))
+                metadata.update({
+                    "source": "financial_analyst_csv",
+                    "rows": fin_result.get("rows"),
+                    "columns": fin_result.get("columns"),
+                    "chart_created": fin_result.get("chart_created", False),
+                    "chart_png_base64": fin_result.get("chart_png_base64"),
+                })
+            else:
+                raise HTTPException(status_code=400, detail="financial-data requires CSV input.")
+        elif payload.agent_id == "payroll-analyst":
+            if payload.table_csv:
+                payroll_result = run_payroll_analyst(payload.table_csv, None, payload.prompt)
+                answer = json.dumps(payroll_result)
+                metadata["source"] = "payroll_analyst_csv"
+            else:
+                raise HTTPException(status_code=400, detail="payroll-analyst requires CSV input.")
+        elif payload.agent_id == "sales-pipeline":
+            if payload.table_csv:
+                sales_result = run_sales_pipeline_analyst(payload.table_csv, None, payload.prompt)
+                answer = json.dumps(sales_result)
+                metadata["source"] = "sales_pipeline_analyst_csv"
+            else:
+                raise HTTPException(status_code=400, detail="sales-pipeline requires CSV input.")
+        elif payload.agent_id == "json-analyst":
+            # JSON analyst can accept either table_json or raw JSON in prompt
+            if payload.table_json is not None:
+                json_result = run_json_analyst(json.dumps(payload.table_json), payload.prompt)
+                answer = json.dumps(json_result)
+                metadata["source"] = "json_analyst_json"
+            else:
+                raise HTTPException(status_code=400, detail="json-analyst requires table_json input.")
+        elif payload.agent_id == "churn-analyzer":
+            if payload.table_csv:
+                churn_result = run_churn_analyzer(payload.table_csv, None, payload.prompt)
+                answer = json.dumps(churn_result)
+                metadata["source"] = "churn_analyzer_csv"
+            else:
+                raise HTTPException(status_code=400, detail="churn-analyzer requires CSV input.")
+        elif payload.agent_id == "attendance-analyzer":
+            if payload.table_csv:
+                attendance_result = run_attendance_analyzer(payload.table_csv, None, payload.prompt)
+                answer = json.dumps(attendance_result)
+                metadata["source"] = "attendance_analyzer_csv"
+            else:
+                raise HTTPException(status_code=400, detail="attendance-analyzer requires CSV input.")
+        elif payload.agent_id == "word-analyst":
+            if payload.file_path:
+                file_path = payload.file_path
+                if not os.path.isabs(file_path):
+                    file_path = str(UPLOAD_DIR / file_path)
+                if not Path(file_path).exists():
+                    raise HTTPException(status_code=400, detail=f"File not found: {payload.file_path}")
+                word_result = run_word_analyst(payload.table_csv, payload.table_json, payload.prompt, file_path)
+            elif payload.table_csv or payload.table_json:
+                word_result = run_word_analyst(payload.table_csv, payload.table_json, payload.prompt)
+            else:
+                raise HTTPException(status_code=400, detail="word-analyst requires file_path, CSV, or table_json input.")
+
+            if isinstance(word_result, dict):
+                answer = (
+                    word_result.get("answer")
+                    or word_result.get("summary")
+                    or word_result.get("message")
+                    or json.dumps(word_result, ensure_ascii=False)
+                )
+                result_metadata = word_result.get("metadata")
+                if isinstance(result_metadata, dict):
+                    # Serialize datetime objects to ISO format strings
+                    result_metadata = serialize_datetime_objects(result_metadata)
+                    metadata.update(result_metadata)
+                metadata.update({"source": "word_analyst"})
+
+                for download_field in ("edited_docx_path", "generated_docx_path", "download_path"):
+                    path_value = word_result.get(download_field)
+                    if path_value:
+                        try:
+                            download_path = Path(path_value).resolve()
+                            upload_root = UPLOAD_DIR.resolve()
+                            if download_path.is_file() and str(download_path).startswith(str(upload_root)):
+                                relative_path = str(download_path.relative_to(upload_root))
+                                metadata["download_url"] = f"/api/download-file?file_path={quote_plus(relative_path)}"
+                                metadata["download_name"] = download_path.name
+                                break
+                        except Exception:
+                            continue
+            else:
+                answer = str(word_result)
+                metadata.update({"source": "word_analyst"})
+        elif payload.agent_id == "ppt-analyst":
+            if payload.table_csv or payload.table_json:
+                ppt_result = run_ppt_analyst(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(ppt_result)
+                metadata["source"] = "ppt_analyst"
+            else:
+                raise HTTPException(status_code=400, detail="ppt-analyst requires CSV or table_json input.")
+        elif payload.agent_id == "email-analyzer":
+            if payload.table_csv or payload.table_json:
+                email_result = run_email_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(email_result)
+                metadata["source"] = "email_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="email-analyzer requires CSV or table_json input.")
+        elif payload.agent_id == "transcript-analyzer":
+            if payload.table_csv or payload.table_json:
+                transcript_result = run_transcript_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(transcript_result)
+                metadata["source"] = "transcript_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="transcript-analyzer requires CSV or table_json input.")
+        elif payload.agent_id == "invoice-processor":
+            if payload.table_csv or payload.table_json:
+                invoice_result = run_invoice_processor(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(invoice_result)
+                metadata["source"] = "invoice_processor"
+            else:
+                raise HTTPException(status_code=400, detail="invoice-processor requires CSV or table_json input.")
+        elif payload.agent_id == "recruitment-analyst":
+            if payload.table_csv or payload.table_json:
+                recruitment_result = run_recruitment_analyst(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(recruitment_result)
+                metadata["source"] = "recruitment_analyst"
+            else:
+                raise HTTPException(status_code=400, detail="recruitment-analyst requires CSV or table_json input.")
+        elif payload.agent_id == "performance-review":
+            if payload.table_csv or payload.table_json:
+                perf_result = run_performance_review_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(perf_result)
+                metadata["source"] = "performance_review_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="performance-review requires CSV or table_json input.")
+        elif payload.agent_id == "budget-actuals":
+            if payload.table_csv or payload.table_json:
+                budget_result = run_budget_actuals_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(budget_result)
+                metadata["source"] = "budget_actuals_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="budget-actuals requires CSV or table_json input.")
+        elif payload.agent_id == "expense-auditor":
+            if payload.table_csv or payload.table_json:
+                expense_result = run_expense_auditor(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(expense_result)
+                metadata["source"] = "expense_auditor"
+            else:
+                raise HTTPException(status_code=400, detail="expense-auditor requires CSV or table_json input.")
+        elif payload.agent_id == "ar-aging":
+            if payload.table_csv or payload.table_json:
+                ar_result = run_ar_aging_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(ar_result)
+                metadata["source"] = "ar_aging_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="ar-aging requires CSV or table_json input.")
+        elif payload.agent_id == "cashflow-forecast":
+            if payload.table_csv or payload.table_json:
+                cashflow_result = run_cashflow_forecast_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(cashflow_result)
+                metadata["source"] = "cashflow_forecast_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="cashflow-forecast requires CSV or table_json input.")
+        elif payload.agent_id == "vendor-spend":
+            if payload.table_csv or payload.table_json:
+                vendor_result = run_vendor_spend_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(vendor_result)
+                metadata["source"] = "vendor_spend_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="vendor-spend requires CSV or table_json input.")
+        elif payload.agent_id == "payment-optimizer":
+            if payload.table_csv or payload.table_json:
+                payment_result = run_payment_optimizer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(payment_result)
+                metadata["source"] = "payment_optimizer"
+            else:
+                raise HTTPException(status_code=400, detail="payment-optimizer requires CSV or table_json input.")
+        elif payload.agent_id == "project-timeline":
+            if payload.table_csv or payload.table_json:
+                project_result = run_project_timeline_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(project_result)
+                metadata["source"] = "project_timeline_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="project-timeline requires CSV or table_json input.")
+        elif payload.agent_id == "sla-compliance":
+            if payload.table_csv or payload.table_json:
+                sla_result = run_sla_compliance_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(sla_result)
+                metadata["source"] = "sla_compliance_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="sla-compliance requires CSV or table_json input.")
+        elif payload.agent_id == "inventory-analyst":
+            if payload.table_csv or payload.table_json:
+                inventory_result = run_inventory_analyst(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(inventory_result)
+                metadata["source"] = "inventory_analyst"
+            else:
+                raise HTTPException(status_code=400, detail="inventory-analyst requires CSV or table_json input.")
+        elif payload.agent_id == "supply-chain":
+            if payload.table_csv or payload.table_json:
+                supply_result = run_supply_chain_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(supply_result)
+                metadata["source"] = "supply_chain_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="supply-chain requires CSV or table_json input.")
+        elif payload.agent_id == "leads-analyzer":
+            if payload.table_csv or payload.table_json:
+                leads_result = run_leads_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(leads_result)
+                metadata["source"] = "leads_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="leads-analyzer requires CSV or table_json input.")
+        elif payload.agent_id == "campaign-performance":
+            if payload.table_csv or payload.table_json:
+                campaign_result = run_campaign_performance_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(campaign_result)
+                metadata["source"] = "campaign_performance_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="campaign-performance requires CSV or table_json input.")
+        elif payload.agent_id == "survey-analyzer":
+            if payload.table_csv or payload.table_json:
+                survey_result = run_survey_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(survey_result)
+                metadata["source"] = "survey_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="survey-analyzer requires CSV or table_json input.")
+        elif payload.agent_id == "access-rights":
+            if payload.table_csv or payload.table_json:
+                access_result = run_access_rights_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(access_result)
+                metadata["source"] = "access_rights_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="access-rights requires CSV or table_json input.")
+        elif payload.agent_id == "license-tracker":
+            if payload.table_csv or payload.table_json:
+                license_result = run_license_tracker_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(license_result)
+                metadata["source"] = "license_tracker_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="license-tracker requires CSV or table_json input.")
+        elif payload.agent_id == "incident-analyzer":
+            if payload.table_csv or payload.table_json:
+                incident_result = run_incident_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(incident_result)
+                metadata["source"] = "incident_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="incident-analyzer requires CSV or table_json input.")
+        elif payload.agent_id == "ml-modeler":
+            if payload.table_csv or payload.table_json:
+                ml_result = run_ml_modeler(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(ml_result)
+                metadata["source"] = "ml_modeler"
+            else:
+                raise HTTPException(status_code=400, detail="ml-modeler requires CSV or table_json input.")
+        elif payload.agent_id == "log-analyst":
+            if payload.table_csv or payload.table_json:
+                log_result = run_log_analyst(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(log_result)
+                metadata["source"] = "log_analyst"
+            else:
+                raise HTTPException(status_code=400, detail="log-analyst requires CSV or table_json input.")
+        elif payload.agent_id == "image-processor":
+            if payload.table_csv or payload.table_json:
+                image_result = run_image_processor(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(image_result)
+                metadata["source"] = "image_processor"
+            else:
+                raise HTTPException(status_code=400, detail="image-processor requires CSV or table_json input.")
+        elif payload.agent_id == "pdf-extractor":
+            if payload.table_csv or payload.table_json:
+                pdf_result = run_pdf_extractor(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(pdf_result)
+                metadata["source"] = "pdf_extractor"
+            else:
+                raise HTTPException(status_code=400, detail="pdf-extractor requires CSV or table_json input.")
+        elif payload.agent_id == "timeseries-forecaster":
+            if payload.table_csv or payload.table_json:
+                ts_result = run_timeseries_forecaster(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(ts_result)
+                metadata["source"] = "timeseries_forecaster"
+            else:
+                raise HTTPException(status_code=400, detail="timeseries-forecaster requires CSV or table_json input.")
+        elif payload.agent_id == "multifile-correlation":
+            if payload.table_csv or payload.table_json:
+                multi_result = run_multifile_correlation_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(multi_result)
+                metadata["source"] = "multifile_correlation_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="multifile-correlation requires CSV or table_json input.")
+        elif payload.agent_id == "data-quality":
+            if payload.table_csv or payload.table_json:
+                quality_result = run_data_quality_analyzer(payload.table_csv, payload.table_json, payload.prompt)
+                answer = json.dumps(quality_result)
+                metadata["source"] = "data_quality_analyzer"
+            else:
+                raise HTTPException(status_code=400, detail="data-quality requires CSV or table_json input.")
+        elif payload.table_csv or payload.table_json:
+            table_data = payload.table_json if payload.table_json is not None else payload.table_csv
+            answer = langchain_executor.run_dataframe_agent(
+                table_data=table_data,
+                prompt=payload.prompt,
+            )
+            metadata["source"] = "dataframe_agent"
+        elif payload.mode in ("plan", "preview"):
+            preview = agent.plan(payload.prompt, top_k=payload.top_k)
+            answer = json.dumps({
+                "goal": preview.goal,
+                "planned_tools": preview.planned_tools,
+                "irreversible_tools": preview.irreversible_tools,
+                "needs_confirmation": preview.needs_confirmation,
+            })
+            metadata["source"] = "plan_preview"
+        elif payload.mode in ("execute", "run", "workflow"):
+            preview = agent.plan(payload.prompt, top_k=payload.top_k)
+            result = agent.execute_plan(preview, confirmed=payload.confirm)
+            answer = result.answer
+            metadata.update({
+                "source": "execute_plan",
+                "steps": [step.to_dict() for step in result.steps],
+                "partial": result.partial,
+                "goal_achieved": result.goal_achieved,
+                "duration_ms": getattr(result, "total_duration_ms", None),
+            })
+        elif payload.mode == "report":
+            report_result = agent.generate_report(payload.prompt, top_k=payload.top_k)
+            answer = json.dumps(report_result.to_dict())
+            metadata["source"] = "report"
+        elif payload.mode in ("graph", "langgraph"):
+            graph_result = langchain_executor.run_langgraph_workflow(payload.agent_id, payload.prompt)
+            answer = graph_result.get("result", "")
+            metadata.update({"source": "langgraph_workflow", "graph_result": graph_result})
+        elif payload.use_langchain:
+            answer = langchain_executor.chat(payload.prompt, payload.agent_id, max_tokens=1024)
+            metadata["source"] = "langchain_chat"
+        else:
+            query_result = agent.query(payload.prompt, top_k=payload.top_k)
+            answer = query_result.answer
+            metadata.update({
+                "source": "query",
+                "query": query_result.query,
+                "chunks": [chunk.to_dict() for chunk in query_result.chunks],
+            })
+    except Exception as exc:
+        logger.error(f"Agent run failed for {payload.agent_id}: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Ensure answer is a string for the response model
+    if not isinstance(answer, str):
+        try:
+            answer = json.dumps(answer)
+        except Exception:
+            answer = str(answer)
+
+    return AgentExecutionResponse(
+        agent_id=payload.agent_id,
+        mode=payload.mode,
+        answer=answer,
+        metadata=metadata,
+    )
+
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_documents(
+    files: List[UploadFile] = File(...),
+    category: Optional[str] = Form("General"),
+    user_goal: Optional[str] = Form(None),
+    priority: Optional[str] = Form("Medium"),
+    due_date: Optional[str] = Form(None),
+) -> UploadResponse:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+
+    # Basic validation limits
+    MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))  # 10 MB default
+    ALLOWED_EXT = {".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".db", ".sqlite"}
+
+    ingested: List[Dict[str, Any]] = []
+    metadata = {
+        "category": category,
+        "user_goal": user_goal or "",
+        "priority": priority,
+        "due_date": due_date,
+    }
+
+    for upload in files:
+        file_name = Path(upload.filename).name
+        file_path = UPLOAD_DIR / file_name
+        try:
+            contents = await upload.read()
+            # Size validation
+            if len(contents) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"File {file_name} exceeds maximum upload size of {MAX_UPLOAD_BYTES} bytes.")
+
+            # Extension validation
+            ext = Path(file_name).suffix.lower()
+            if ext not in ALLOWED_EXT:
+                raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
+            file_path.write_bytes(contents)
+            asset = agent.ingest_file(str(file_path), metadata)
+            ingested.append(asset.to_dict())
+        except Exception as exc:
+            logger.error(f"Failed to ingest {file_name}: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"ingested": ingested}
+
+
+async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
+
+    file_name = Path(file.filename).name
+    file_path = UPLOAD_DIR / file_name
+    
+    contents = await file.read()
+    
+    # Size validation (10 MB max)
+    MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of 10 MB.")
+    
+    # Extension validation for data files
+    ext = Path(file_name).suffix.lower()
+    ALLOWED_EXT = {".db", ".sqlite", ".sqlite3", ".csv", ".xlsx", ".xls", ".json", ".docx", ".doc", ".pdf"}
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}. Allowed: {ALLOWED_EXT}")
+    
+    file_path.write_bytes(contents)
+    return {
+        "file_path": file_name,
+        "absolute_path": str(file_path),
+        "message": f"File uploaded successfully"
+    }
+
+
+@app.post("/upload-file")
+async def upload_file_simple(file: UploadFile = File(...)) -> Dict[str, str]:
+    return await _save_uploaded_file(file)
+
+
+@app.post("/upload")
+async def upload_file_alias(file: UploadFile = File(...)) -> Dict[str, str]:
+    return await _save_uploaded_file(file)
+
+
+@app.get("/download-file")
+async def download_file(file_path: str) -> FileResponse:
+    resolved_root = UPLOAD_DIR.resolve()
+    requested_path = (UPLOAD_DIR / file_path).resolve()
+    if not str(requested_path).startswith(str(resolved_root)):
+        raise HTTPException(status_code=403, detail="Forbidden file path")
+    if not requested_path.exists() or not requested_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        path=str(requested_path),
+        filename=requested_path.name,
+        media_type="application/octet-stream",
+    )
+
+
+@app.post("/plan", response_model=PlanPreviewResponse)
+async def plan_agent(payload: PlanRequest) -> PlanPreviewResponse:
+    if not payload.goal or not payload.goal.strip():
+        raise HTTPException(status_code=400, detail="Goal cannot be empty.")
+
+    preview = agent.plan(payload.goal, top_k=payload.top_k)
+    return {
+        "goal": preview.goal,
+        "planned_tools": preview.planned_tools,
+        "irreversible_tools": preview.irreversible_tools,
+        "needs_confirmation": preview.needs_confirmation,
+        "chunk_count": len(preview.chunks),
+    }
+
+
+@app.post("/execute-plan", response_model=PlanExecutionResponse)
+async def execute_plan(payload: ExecutePlanRequest) -> PlanExecutionResponse:
+    if not payload.goal or not payload.goal.strip():
+        raise HTTPException(status_code=400, detail="Goal cannot be empty.")
+
+    plan_preview = agent.plan(payload.goal, top_k=payload.top_k)
+    try:
+        result = agent.execute_plan(plan_preview, confirmed=payload.confirm)
+        return result.to_dict()
+    except ConfirmationRequiredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/report", response_model=ReportResponse)
+async def build_report(payload: ReportRequest) -> ReportResponse:
+    if not payload.goal or not payload.goal.strip():
+        raise HTTPException(status_code=400, detail="Report goal cannot be empty.")
+
+    result = agent.generate_report(payload.goal, query=payload.query, top_k=payload.top_k)
+    return result.to_dict()
+
+
+@app.post("/report/execute-block")
+async def execute_report_block(payload: Dict[str, Any]) -> Dict[str, Any]:
+    block_id = payload.get("block_id")
+    code = payload.get("code")
+    section_name = payload.get("section_name") or payload.get("section") or ""
+
+    if not block_id:
+        raise HTTPException(status_code=400, detail="Missing block_id")
+
+    # Build a minimal CodeBlock object and execute via ReportBuilder
+    try:
+        block = CodeBlock(block_id=str(block_id), section_name=section_name, code=code or "")
+        updated = agent.reporter.execute_code_block(block, edited_code=code)
+        return {"code_block": updated.to_dict()}
+    except Exception as exc:
+        logger.error(f"Failed to execute code block {block_id}: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/report/finalize", response_model=ReportResponse)
+async def finalize_report(payload: Dict[str, Any]) -> ReportResponse:
+    # Expect full report payload from frontend (sections, code blocks, goal)
+    try:
+        goal = payload.get("goal", "Report")
+        sections_payload = payload.get("sections", [])
+        sections: List[ReportSection] = []
+        pending_blocks: List[CodeBlock] = []
+
+        for s in sections_payload:
+            cb = None
+            if s.get("code_block"):
+                c = s.get("code_block")
+                cb = CodeBlock(
+                    block_id=c.get("block_id", ""),
+                    section_name=s.get("title", ""),
+                    code=c.get("code", ""),
+                    status=c.get("status", "pending"),
+                    stdout=c.get("stdout"),
+                    stderr=c.get("stderr"),
+                    images=c.get("images") or [],
+                    include_in_report=c.get("include_in_report", True),
+                )
+                if cb.status in ("pending",):
+                    pending_blocks.append(cb)
+
+            section = ReportSection(
+                title=s.get("title", ""),
+                content=s.get("content", ""),
+                code_block=cb,
+                chart_base64=s.get("chart_base64"),
+            )
+            sections.append(section)
+
+        report_obj = BuiltReportResult(
+            goal=goal,
+            sections=sections,
+            pending_code_blocks=pending_blocks,
+            html=payload.get("html"),
+            ready_to_finalize=len(pending_blocks) == 0,
+        )
+
+        finalized = agent.reporter.finalize(report_obj)
+        return finalized.to_dict()
+    except Exception as exc:
+        logger.error(f"Failed to finalize report: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/execute-plan/stream")
+async def execute_plan_stream(goal: str, top_k: int = 5):
+    if not goal or not goal.strip():
+        raise HTTPException(status_code=400, detail="Goal cannot be empty.")
+
+    # Obtain planning context
+    preview = agent.plan(goal, top_k=top_k)
+
+    # Use planner internals to create PlanStep list
+    plan_steps = agent.planner._plan_phase(goal, preview.chunks)
+
+    def event(data: Any) -> bytes:
+        payload = json.dumps(data, default=str)
+        return f"data: {payload}\n\n".encode("utf-8")
+
+    def gen():
+        # Send initial preview
+        yield event({"type": "preview", "planned_tools": preview.planned_tools, "irreversible": preview.irreversible_tools})
+
+        completed: Dict[int, Any] = {}
+
+        # Execute steps sequentially and stream updates
+        for step in plan_steps:
+            try:
+                # notify running
+                yield event({"type": "step", "step": step.step_num, "tool": step.tool_name, "status": "running", "rationale": step.rationale})
+
+                if step.tool_name is None:
+                    # direct answer
+                    answer = agent.llm.generate(f"Answer for goal: {goal}")
+                    step.result = {"answer": answer}
+                    step.status = "success"
+                else:
+                    # execute tool via MCP
+                    try:
+                        result = agent.mcp.call_tool(step.tool_name, **(step.args or {}))
+                        step.result = result
+                        step.status = "success"
+                    except Exception as exc:
+                        step.status = "error"
+                        step.error_msg = str(exc)
+
+                completed[step.step_num] = step
+
+                # stream step result
+                yield event({"type": "step_result", "step": step.step_num, "tool": step.tool_name, "status": step.status, "result": step.result, "error": step.error_msg})
+            except Exception as exc:
+                yield event({"type": "step_result", "step": step.step_num, "tool": getattr(step, 'tool_name', None), "status": "error", "error": str(exc)})
+
+        # Verification / finalization
+        verify = agent.planner._verify_phase(goal, preview.chunks, {s.step_num: s for s in completed.values()})
+        yield event({"type": "done", "answer": verify.answer, "goal_achieved": verify.goal_achieved, "steps": [s.to_dict() for s in completed.values()]})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/documents", response_model=List[DocumentAssetResponse])
+async def list_documents(category: Optional[str] = None) -> List[DocumentAssetResponse]:
+    docs = agent.documents.list_documents(category)
+    return [doc.to_dict() for doc in docs]
+
+
+@app.post("/tools/credentials")
+async def update_tool_credentials(
+    payload: ToolCredentialsRequest,
+) -> Dict[str, Any]:
+    if not payload.credentials:
+        raise HTTPException(status_code=400, detail="No credentials provided.")
+    try:
+        ToolCredentialStore.update(payload.credentials)
+    except Exception as exc:
+        logger.error(f"Failed to save tool credentials: {exc}")
+        raise HTTPException(status_code=500, detail="Unable to save tool credentials.")
+    return {"status": "ok", "updated_keys": sorted(payload.credentials.keys())}
+
+
+@app.get("/status", response_model=StatusResponse)
+async def status() -> StatusResponse:
+    return StatusResponse(**agent.get_status())

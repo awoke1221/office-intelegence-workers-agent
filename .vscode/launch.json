@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Streamlit App",
+      "type": "python",
+      "request": "launch",
+      "program": "${command:python.interpreterPath}",
+      "args": ["-m", "streamlit", "run", "${workspaceFolder}/streamlit_app.py"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}

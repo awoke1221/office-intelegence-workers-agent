@@ -1,7 +1,0 @@
-[
-  {
-    "timestamp": "2026-06-12T02:48:47.666224Z",
-    "user": "ok, what is this data?",
-    "assistant": "[OpenAIAdapter] Error: Error code: 400 - {'error': {'message': 'Failed to deserialize the JSON body into the target type: messages[3]: missing field `tool_call_id` at line 1 column 7983', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_request_error'}}\n\nExecution Summary:\n- python_execute (iteration 1): Success"
-  }
-]

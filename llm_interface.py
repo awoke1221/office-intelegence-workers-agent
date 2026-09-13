@@ -91,6 +91,24 @@ class MockLLM(BaseLLM):
         header = "[MOCK LLM RESPONSE]\n"
         return header + prompt[:400]
 
+    def invoke(self, messages, **kwargs):
+        text = ""
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, tuple) and len(msg) == 2:
+                    _, payload = msg
+                    text += str(payload)
+                elif isinstance(msg, dict):
+                    role = msg.get("role")
+                    content = msg.get("content")
+                    if content is not None:
+                        text += f"{role}: {content}\n"
+                else:
+                    text += str(msg)
+        else:
+            text = str(messages)
+        return type("MockResponse", (), {"content": self.generate(text, **kwargs)})()
+
     def generate_with_tools(self, prompt: str, tools: List[dict], messages: List[dict] | None = None) -> ToolCallResponse:
         return super().generate_with_tools(prompt, tools, messages)
 
@@ -242,13 +260,23 @@ class LLMFactory:
 
         if name == 'mock':
             return MockLLM()
+
+        api_key = config.get('api_key') if isinstance(config, dict) else None
+        env_api_key = os.environ.get('OPENAI_API_KEY') or os.environ.get('DEEPSEEK_API_KEY') or os.environ.get('LLM_API_KEY')
+
         if name in ('openai', 'chatgpt'):
+            if not (api_key or env_api_key):
+                return MockLLM()
             return OpenAIAdapter(config)
         if name in ('huggingface', 'hf'):
             return HuggingFaceAdapter(config)
         if name == 'deepseek':
+            if not (api_key or env_api_key):
+                return MockLLM()
             return DeepseekAdapter(config)
         if name == 'gemini':
+            if not (config.get('api_key') or os.environ.get('GEMINI_API_KEY')):
+                return MockLLM()
             return GeminiAdapter(config)
         return MockLLM()
 

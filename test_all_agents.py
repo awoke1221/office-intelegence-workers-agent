@@ -136,47 +136,38 @@ def validate_response(response: Dict[str, Any], agent_id: str) -> bool:
     return True
 
 
-def test_agent_import(agent_id: str) -> bool:
+def test_agent_import() -> None:
     """Test that agent module can be imported."""
-    base = agent_id.replace("-", "_")
-    candidates = [f"{base}_agent", f"{base}_analyzer", f"{base}_analyst", base]
-    for module_name in candidates:
-        try:
-            __import__(module_name)
-            return True
-        except ImportError:
-            continue
-    return False
+    for agent_id in sorted(TEST_AGENTS):
+        base = agent_id.replace("-", "_")
+        candidates = [f"{base}_agent", f"{base}_analyzer", f"{base}_analyst", base]
+        imported = False
+        for module_name in candidates:
+            try:
+                __import__(module_name)
+                imported = True
+                break
+            except ImportError:
+                continue
+        assert imported, f"Could not import {agent_id}"
 
 
-def test_agent_in_registry(agent_id: str) -> bool:
+def test_agent_in_registry() -> None:
     """Test that agent is in registry."""
-    try:
-        from backend_agent_registry import is_known_agent
-        return is_known_agent(agent_id)
-    except Exception:
-        return False
+    from backend_agent_registry import is_known_agent
+    for agent_id in sorted(TEST_AGENTS):
+        assert is_known_agent(agent_id), f"{agent_id} not in registry"
 
 
-def test_create_request(agent_id: str, test_config: Dict[str, str]) -> bool:
+def test_create_request() -> None:
     """Test that valid request can be created."""
-    try:
+    for agent_id, test_config in TEST_AGENTS.items():
         request = create_mock_agent_request(agent_id, test_config)
-        
-        # Validate structure
         required = ["agent_id", "prompt", "mode"]
         for key in required:
-            if key not in request:
-                return False
-        
-        # Validate has data
-        if not request.get("table_csv") and not request.get("table_json"):
-            if test_config["type"] != "text":  # Text agents don't need data
-                return False
-        
-        return True
-    except Exception:
-        return False
+            assert key in request, f"Request for {agent_id} missing {key}"
+        if test_config["type"] != "text":
+            assert request.get("table_csv") or request.get("table_json"), f"Request for {agent_id} has no data"
 
 
 def main():

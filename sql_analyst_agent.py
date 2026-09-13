@@ -17,7 +17,7 @@ import pandas as pd
 from langchain_openai import ChatOpenAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
-from llm_interface import BaseLLM, LLMFactory, ToolCallResponse
+from llm_interface import BaseLLM, LLMFactory, MockLLM, ToolCallResponse
 from tools import PythonExecutionTool
 
 SQL_ANALYST_SYSTEM_PROMPT = """You are an Advanced AI Data Analyst Agent.
@@ -364,7 +364,7 @@ PYTHON_TOOL = PythonExecutionTool()
 AVAILABLE_TOOLS = [PYTHON_TOOL.to_openai_tool()]
 
 
-def _build_langchain_llm() -> ChatOpenAI:
+def _build_langchain_llm():
     kwargs: Dict[str, Any] = {
         "model": DEFAULT_MODEL,
         "temperature": DEFAULT_TEMPERATURE,
@@ -373,7 +373,14 @@ def _build_langchain_llm() -> ChatOpenAI:
         kwargs["api_key"] = DEFAULT_API_KEY
     if DEFAULT_API_BASE:
         kwargs["base_url"] = DEFAULT_API_BASE
-    return ChatOpenAI(**kwargs)
+
+    if not DEFAULT_API_KEY and not DEFAULT_API_BASE:
+        return MockLLM()
+
+    try:
+        return ChatOpenAI(**kwargs)
+    except Exception:
+        return MockLLM()
 
 
 def _run_pandas_dataframe_agent(table_json: List[Dict[str, Any]], prompt: str, max_iterations: int = 5) -> str:
@@ -883,11 +890,11 @@ def run_sql_analyst(
     if db_file:
         if not os.path.exists(db_file):
             return {"error": f"Database file not found: {db_file}"}
-        return _analyze_with_llm(prompt, db_path=db_file)
+        return agent_reasoning_loop(prompt=prompt, db_path=db_file, max_iterations=5)
 
     if table_json is not None:
         if not table_json:
             return {"error": "Table JSON is empty."}
-        return _analyze_with_llm(prompt, table_json=table_json)
+        return agent_reasoning_loop(prompt=prompt, table_json=table_json, max_iterations=5)
 
     return {"error": "No database file, SQL query, or table JSON provided."}

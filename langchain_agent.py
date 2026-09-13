@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
 from backend_agent_registry import get_agent_info
+from llm_interface import MockLLM
 
 
 DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", os.environ.get("LLM_MODEL", os.environ.get("OPENAI_MODEL", "deepseek-chat")))
@@ -33,7 +34,7 @@ class LangChainAgentExecutor:
         self.base_url = config.get("base_url", DEFAULT_OPENAI_API_BASE)
         self.llm = self._build_llm()
 
-    def _build_llm(self) -> ChatOpenAI:
+    def _build_llm(self):
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,
@@ -42,7 +43,14 @@ class LangChainAgentExecutor:
             kwargs["api_key"] = self.api_key
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        return ChatOpenAI(**kwargs)
+
+        if not self.api_key and not self.base_url:
+            return MockLLM()
+
+        try:
+            return ChatOpenAI(**kwargs)
+        except Exception:
+            return MockLLM()
 
     def build_system_prompt(self, agent_id: str, prompt: str) -> str:
         agent_info = get_agent_info(agent_id)

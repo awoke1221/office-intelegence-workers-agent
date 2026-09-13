@@ -8,12 +8,13 @@ sentence-transformers
 faiss-cpu
 huggingface-hub
 pypdf
-python-magic-bin
+python-magic
 transformers
 openai
 python-dotenv
 fastapi
 uvicorn
+gunicorn
 supabase
 google-api-python-client
 google-auth

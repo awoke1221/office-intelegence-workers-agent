@@ -66,6 +66,7 @@ class AdvancedRAG:
         self.embedding_model_name = embedding_model_name or EMBEDDING_MODEL
         self._embedder = SentenceTransformer(self.embedding_model_name)
         self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model_name, model=self._embedder)
+        self.embedding_dim = int(getattr(self._embedder, "get_sentence_embedding_dimension", lambda: EMBEDDING_DIM)()) or EMBEDDING_DIM
 
         # optional reranker
         self.rerank_model_name = rerank_model or RERANK_MODEL
@@ -74,6 +75,7 @@ class AdvancedRAG:
             self._reranker = CrossEncoder(self.rerank_model_name)
         except Exception:
             self._reranker = None
+        self.reranker = self._reranker
 
         # BM25 structures
         self._texts: List[str] = []
@@ -81,10 +83,12 @@ class AdvancedRAG:
         self._metas: List[dict] = []
         self._chunk_ids: List[str] = []
         self._bm25 = BM25Okapi(self._tokenized_texts) if _BM25_AVAILABLE else None
+        self.bm25 = self._bm25
 
         # vector index
         self._emb_matrix: np.ndarray = np.empty((0, EMBEDDING_DIM), dtype=np.float32)
         self._faiss_index = None
+        self.faiss_index = self._faiss_index
 
         # simple in-memory knowledge graph (adjacency)
         self._kg_nodes: Dict[str, dict] = {}
@@ -128,6 +132,7 @@ class AdvancedRAG:
                     self._faiss_index.add(self._emb_matrix)
             else:
                 self._faiss_index.add(new_embs)
+        self.faiss_index = self._faiss_index
 
         # optionally extract KG entities from metas
         for meta in metas:
@@ -145,6 +150,7 @@ class AdvancedRAG:
             self._faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
             if len(self._emb_matrix) > 0:
                 self._faiss_index.add(self._emb_matrix)
+        self.faiss_index = self._faiss_index
         self._dirty_count = 0
 
     # -------------------- Hybrid search --------------------

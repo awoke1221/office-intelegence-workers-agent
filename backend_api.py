@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import base64
+import hashlib
+import hmac
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,9 +17,9 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote_plus
 
@@ -67,6 +71,53 @@ from tools import ToolCredentialStore
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+SERVICE_TOKEN_ISSUER = "denbegaye-nextjs"
+SERVICE_TOKEN_AUDIENCE = "office-intelligence"
+
+
+def _decode_base64url(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _verify_service_token(token: str) -> Dict[str, Any]:
+    secret = os.environ.get("OFFICE_INTELLIGENCE_SHARED_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Office Intelligence auth is not configured.")
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid service token.")
+
+    header_part, payload_part, signature_part = parts
+    signing_input = f"{header_part}.{payload_part}".encode("ascii")
+    expected_signature = hmac.new(
+        secret.encode("utf-8"), signing_input, hashlib.sha256
+    ).digest()
+    try:
+        actual_signature = _decode_base64url(signature_part)
+        header = json.loads(_decode_base64url(header_part))
+        payload = json.loads(_decode_base64url(payload_part))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid service token.") from exc
+
+    if not hmac.compare_digest(actual_signature, expected_signature):
+        raise HTTPException(status_code=401, detail="Invalid service token.")
+    if header.get("alg") != "HS256" or header.get("typ") != "JWT":
+        raise HTTPException(status_code=401, detail="Invalid service token.")
+    if payload.get("iss") != SERVICE_TOKEN_ISSUER or payload.get("aud") != SERVICE_TOKEN_AUDIENCE:
+        raise HTTPException(status_code=401, detail="Invalid service token claims.")
+
+    try:
+        expires_at = int(payload["exp"])
+        issued_at = int(payload["iat"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid service token timestamps.") from exc
+
+    now = int(time.time())
+    if expires_at <= now or issued_at > now + 30:
+        raise HTTPException(status_code=401, detail="Service token expired or not yet valid.")
+    return payload
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -191,13 +242,53 @@ def create_agent() -> AgentOrchestrator:
 
 
 app = FastAPI(title="Microfinance Worker Agent API", version="1.0.0")
+allowed_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "OFFICE_INTELLIGENCE_ALLOWED_ORIGINS", "http://localhost:3000"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authenticate_service_request(request: Request, call_next):
+    started_at = time.perf_counter()
+    caller = "anonymous"
+
+    if request.url.path != "/health":
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            logger.warning("office_request_denied method=%s path=%s reason=missing_bearer", request.method, request.url.path)
+            return JSONResponse({"detail": "Authentication required."}, status_code=401)
+        try:
+            claims = _verify_service_token(auth_header[7:].strip())
+            caller = str(claims.get("sub", "unknown"))
+            request.state.authenticated_caller = caller
+        except HTTPException as exc:
+            logger.warning("office_request_denied method=%s path=%s reason=%s", request.method, request.url.path, exc.detail)
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info(
+            "office_request caller=%s method=%s path=%s status=%s duration_ms=%s",
+            caller,
+            request.method,
+            request.url.path,
+            getattr(locals().get("response"), "status_code", "error"),
+            duration_ms,
+        )
 
 agent = create_agent()
 langchain_executor = LangChainAgentExecutor(config=dict(os.environ))

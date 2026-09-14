@@ -1,5 +1,47 @@
-"""Compatibility entrypoint for hosting platforms configured with ``app:app``."""
+"""Lightweight ASGI entrypoint for hosting platforms configured with ``app:app``."""
 
-from backend_api import app
+from __future__ import annotations
+
+import importlib
+import json
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+
+class LazyApplication:
+	"""Keep health checks lightweight and load the full API on demand."""
+
+	def __init__(self) -> None:
+		self._application: Optional[Callable[..., Awaitable[Any]]] = None
+
+	async def __call__(self, scope: Dict[str, Any], receive: Callable[..., Awaitable[Any]], send: Callable[..., Awaitable[Any]]) -> None:
+		if scope["type"] == "lifespan":
+			await self._handle_lifespan(receive, send)
+			return
+
+		if scope["type"] == "http" and scope["path"] == "/health":
+			body = json.dumps({"status": "ok"}).encode("utf-8")
+			await send({
+				"type": "http.response.start",
+				"status": 200,
+				"headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("ascii"))],
+			})
+			await send({"type": "http.response.body", "body": body})
+			return
+
+		if self._application is None:
+			self._application = importlib.import_module("backend_api").app
+		await self._application(scope, receive, send)
+
+	async def _handle_lifespan(self, receive: Callable[..., Awaitable[Any]], send: Callable[..., Awaitable[Any]]) -> None:
+		while True:
+			message = await receive()
+			if message["type"] == "lifespan.startup":
+				await send({"type": "lifespan.startup.complete"})
+			elif message["type"] == "lifespan.shutdown":
+				await send({"type": "lifespan.shutdown.complete"})
+				return
+
+
+app = LazyApplication()
 
 __all__ = ["app"]

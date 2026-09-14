@@ -1,10 +1,12 @@
-"""Lightweight ASGI entrypoint for hosting platforms configured with ``app:app``."""
+"""Compatibility entrypoints for both legacy WSGI and modern ASGI hosting."""
 
 from __future__ import annotations
 
 import importlib
 import json
 from typing import Any, Awaitable, Callable, Dict, Optional
+
+from a2wsgi import ASGIMiddleware
 
 
 class LazyApplication:
@@ -42,6 +44,7 @@ class LazyApplication:
 				return
 
 
-app = LazyApplication()
+asgi_app = LazyApplication()
+app = ASGIMiddleware(asgi_app)
 
-__all__ = ["app"]
+__all__ = ["app", "asgi_app"]

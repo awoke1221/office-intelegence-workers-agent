@@ -48,7 +48,7 @@ Backend is now at `http://localhost:8000`
 Render uses `render.yaml` and starts the ASGI app with Gunicorn's Uvicorn worker:
 
 ```text
-gunicorn office_intelligence.api:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+uvicorn office_intelligence.api:app --host 0.0.0.0 --port $PORT
 ```
 
 Set the Render service start command to exactly the command above. The legacy `app:app` entrypoint is also WSGI-compatible for older Render settings. The API entrypoint is intentionally lightweight. Agent and embedding services are created on first use rather than during import, so deployment health checks do not trigger model downloads.

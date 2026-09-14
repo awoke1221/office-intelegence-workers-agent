@@ -45,6 +45,19 @@ class LazyApplication:
 
 
 asgi_app = LazyApplication()
-app = ASGIMiddleware(asgi_app)
+_backend_wsgi = ASGIMiddleware(asgi_app)
+
+
+def app(environ: Dict[str, Any], start_response: Callable[..., Any]):
+	"""Serve Render's legacy synchronous probes without starting the backend."""
+	path = environ.get("PATH_INFO", "/")
+	if path in ("/", "/health"):
+		body = json.dumps({"status": "ok"}).encode("utf-8")
+		start_response("200 OK", [
+			("Content-Type", "application/json"),
+			("Content-Length", str(len(body))),
+		])
+		return [body]
+	return _backend_wsgi(environ, start_response)
 
 __all__ = ["app", "asgi_app"]

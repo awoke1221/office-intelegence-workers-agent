@@ -38,10 +38,20 @@ Edit `.env` with your API keys (OpenAI, Deepseek, Google, etc.).
 ### 3. Start the Backend
 
 ```powershell
-python -m uvicorn backend_api:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn office_intelligence.api:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Backend is now at `http://localhost:8000`
+
+### Deployment
+
+Render uses `render.yaml` and starts the ASGI app with Gunicorn's Uvicorn worker:
+
+```text
+gunicorn office_intelligence.api:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+```
+
+The API entrypoint is intentionally lightweight. Agent and embedding services are created on first use rather than during import, so deployment health checks do not trigger model downloads.
 
 ### 4. Try It Out
 

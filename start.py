@@ -39,7 +39,7 @@ def ensure_venv() -> None:
 
     if not in_project_venv():
         print("Launching with the repository project virtual environment...")
-        subprocess.call([str(PYTHON_EXE), str(__file__)] + sys.argv[1:])
+        raise SystemExit(subprocess.call([str(PYTHON_EXE), str(__file__)] + sys.argv[1:]))
 
 
 def install_requirements() -> None:
@@ -55,8 +55,6 @@ def run_command(args: list[str]) -> int:
 
 if __name__ == "__main__":
     ensure_venv()
-
-    install_requirements()
 
     if len(sys.argv) > 1:
         raise SystemExit(run_command(sys.argv[1:]))

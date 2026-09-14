@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from urllib.parse import quote_plus
 
-from agent_orchestrator import AgentOrchestrator, ConfirmationRequiredError
+from agent_orchestrator import ConfirmationRequiredError
 from backend_agent_registry import is_known_agent
 from csv_analyst_agent import run_csv_analyst
 from excel_analyst_agent import run_excel_analyst
@@ -68,6 +68,7 @@ from langchain_agent import LangChainAgentExecutor
 from report_builder import CodeBlock, ReportSection, ReportResult as BuiltReportResult
 from fastapi.responses import StreamingResponse
 from tools import ToolCredentialStore
+from office_intelligence.runtime import UPLOAD_DIR, get_agent, get_langchain_executor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -233,14 +234,6 @@ class AgentExecutionResponse(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-def create_agent() -> AgentOrchestrator:
-    config = dict(os.environ)
-    config["llm_provider"] = os.environ.get("LLM_PROVIDER", "deepseek")
-    config["model"] = os.environ.get("DEEPSEEK_MODEL", os.environ.get("LLM_MODEL", "deepseek-chat"))
-    config["session_id"] = os.environ.get("SESSION_ID", "backend_api")
-    return AgentOrchestrator(config=config)
-
-
 app = FastAPI(title="Microfinance Worker Agent API", version="1.0.0")
 allowed_origins = [
     origin.strip()
@@ -290,10 +283,6 @@ async def authenticate_service_request(request: Request, call_next):
             duration_ms,
         )
 
-agent = create_agent()
-langchain_executor = LangChainAgentExecutor(config=dict(os.environ))
-
-
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -304,7 +293,7 @@ async def query_agent(payload: QueryRequest) -> QueryResponse:
     if not payload.prompt or not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
 
-    result = agent.query(payload.prompt, top_k=payload.top_k, filters=payload.filters)
+    result = get_agent().query(payload.prompt, top_k=payload.top_k, filters=payload.filters)
     return {
         "answer": result.answer,
         "query": result.query,
@@ -659,13 +648,13 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
                 raise HTTPException(status_code=400, detail="data-quality requires CSV or table_json input.")
         elif payload.table_csv or payload.table_json:
             table_data = payload.table_json if payload.table_json is not None else payload.table_csv
-            answer = langchain_executor.run_dataframe_agent(
+            answer = get_langchain_executor().run_dataframe_agent(
                 table_data=table_data,
                 prompt=payload.prompt,
             )
             metadata["source"] = "dataframe_agent"
         elif payload.mode in ("plan", "preview"):
-            preview = agent.plan(payload.prompt, top_k=payload.top_k)
+            preview = get_agent().plan(payload.prompt, top_k=payload.top_k)
             answer = json.dumps({
                 "goal": preview.goal,
                 "planned_tools": preview.planned_tools,
@@ -674,8 +663,8 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
             })
             metadata["source"] = "plan_preview"
         elif payload.mode in ("execute", "run", "workflow"):
-            preview = agent.plan(payload.prompt, top_k=payload.top_k)
-            result = agent.execute_plan(preview, confirmed=payload.confirm)
+            preview = get_agent().plan(payload.prompt, top_k=payload.top_k)
+            result = get_agent().execute_plan(preview, confirmed=payload.confirm)
             answer = result.answer
             metadata.update({
                 "source": "execute_plan",
@@ -685,18 +674,18 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
                 "duration_ms": getattr(result, "total_duration_ms", None),
             })
         elif payload.mode == "report":
-            report_result = agent.generate_report(payload.prompt, top_k=payload.top_k)
+            report_result = get_agent().generate_report(payload.prompt, top_k=payload.top_k)
             answer = json.dumps(report_result.to_dict())
             metadata["source"] = "report"
         elif payload.mode in ("graph", "langgraph"):
-            graph_result = langchain_executor.run_langgraph_workflow(payload.agent_id, payload.prompt)
+            graph_result = get_langchain_executor().run_langgraph_workflow(payload.agent_id, payload.prompt)
             answer = graph_result.get("result", "")
             metadata.update({"source": "langgraph_workflow", "graph_result": graph_result})
         elif payload.use_langchain:
-            answer = langchain_executor.chat(payload.prompt, payload.agent_id, max_tokens=1024)
+            answer = get_langchain_executor().chat(payload.prompt, payload.agent_id, max_tokens=1024)
             metadata["source"] = "langchain_chat"
         else:
-            query_result = agent.query(payload.prompt, top_k=payload.top_k)
+            query_result = get_agent().query(payload.prompt, top_k=payload.top_k)
             answer = query_result.answer
             metadata.update({
                 "source": "query",
@@ -759,7 +748,7 @@ async def upload_documents(
             if ext not in ALLOWED_EXT:
                 raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
             file_path.write_bytes(contents)
-            asset = agent.ingest_file(str(file_path), metadata)
+            asset = get_agent().ingest_file(str(file_path), metadata)
             ingested.append(asset.to_dict())
         except Exception as exc:
             logger.error(f"Failed to ingest {file_name}: {exc}")
@@ -826,7 +815,7 @@ async def plan_agent(payload: PlanRequest) -> PlanPreviewResponse:
     if not payload.goal or not payload.goal.strip():
         raise HTTPException(status_code=400, detail="Goal cannot be empty.")
 
-    preview = agent.plan(payload.goal, top_k=payload.top_k)
+    preview = get_agent().plan(payload.goal, top_k=payload.top_k)
     return {
         "goal": preview.goal,
         "planned_tools": preview.planned_tools,
@@ -841,9 +830,9 @@ async def execute_plan(payload: ExecutePlanRequest) -> PlanExecutionResponse:
     if not payload.goal or not payload.goal.strip():
         raise HTTPException(status_code=400, detail="Goal cannot be empty.")
 
-    plan_preview = agent.plan(payload.goal, top_k=payload.top_k)
+    plan_preview = get_agent().plan(payload.goal, top_k=payload.top_k)
     try:
-        result = agent.execute_plan(plan_preview, confirmed=payload.confirm)
+        result = get_agent().execute_plan(plan_preview, confirmed=payload.confirm)
         return result.to_dict()
     except ConfirmationRequiredError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -854,7 +843,7 @@ async def build_report(payload: ReportRequest) -> ReportResponse:
     if not payload.goal or not payload.goal.strip():
         raise HTTPException(status_code=400, detail="Report goal cannot be empty.")
 
-    result = agent.generate_report(payload.goal, query=payload.query, top_k=payload.top_k)
+    result = get_agent().generate_report(payload.goal, query=payload.query, top_k=payload.top_k)
     return result.to_dict()
 
 
@@ -870,7 +859,7 @@ async def execute_report_block(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Build a minimal CodeBlock object and execute via ReportBuilder
     try:
         block = CodeBlock(block_id=str(block_id), section_name=section_name, code=code or "")
-        updated = agent.reporter.execute_code_block(block, edited_code=code)
+        updated = get_agent().reporter.execute_code_block(block, edited_code=code)
         return {"code_block": updated.to_dict()}
     except Exception as exc:
         logger.error(f"Failed to execute code block {block_id}: {exc}")
@@ -919,7 +908,7 @@ async def finalize_report(payload: Dict[str, Any]) -> ReportResponse:
             ready_to_finalize=len(pending_blocks) == 0,
         )
 
-        finalized = agent.reporter.finalize(report_obj)
+        finalized = get_agent().reporter.finalize(report_obj)
         return finalized.to_dict()
     except Exception as exc:
         logger.error(f"Failed to finalize report: {exc}")
@@ -932,10 +921,10 @@ async def execute_plan_stream(goal: str, top_k: int = 5):
         raise HTTPException(status_code=400, detail="Goal cannot be empty.")
 
     # Obtain planning context
-    preview = agent.plan(goal, top_k=top_k)
+    preview = get_agent().plan(goal, top_k=top_k)
 
     # Use planner internals to create PlanStep list
-    plan_steps = agent.planner._plan_phase(goal, preview.chunks)
+    plan_steps = get_agent().planner._plan_phase(goal, preview.chunks)
 
     def event(data: Any) -> bytes:
         payload = json.dumps(data, default=str)
@@ -955,13 +944,13 @@ async def execute_plan_stream(goal: str, top_k: int = 5):
 
                 if step.tool_name is None:
                     # direct answer
-                    answer = agent.llm.generate(f"Answer for goal: {goal}")
+                    answer = get_agent().llm.generate(f"Answer for goal: {goal}")
                     step.result = {"answer": answer}
                     step.status = "success"
                 else:
                     # execute tool via MCP
                     try:
-                        result = agent.mcp.call_tool(step.tool_name, **(step.args or {}))
+                        result = get_agent().mcp.call_tool(step.tool_name, **(step.args or {}))
                         step.result = result
                         step.status = "success"
                     except Exception as exc:
@@ -976,7 +965,7 @@ async def execute_plan_stream(goal: str, top_k: int = 5):
                 yield event({"type": "step_result", "step": step.step_num, "tool": getattr(step, 'tool_name', None), "status": "error", "error": str(exc)})
 
         # Verification / finalization
-        verify = agent.planner._verify_phase(goal, preview.chunks, {s.step_num: s for s in completed.values()})
+        verify = get_agent().planner._verify_phase(goal, preview.chunks, {s.step_num: s for s in completed.values()})
         yield event({"type": "done", "answer": verify.answer, "goal_achieved": verify.goal_achieved, "steps": [s.to_dict() for s in completed.values()]})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -984,7 +973,7 @@ async def execute_plan_stream(goal: str, top_k: int = 5):
 
 @app.get("/documents", response_model=List[DocumentAssetResponse])
 async def list_documents(category: Optional[str] = None) -> List[DocumentAssetResponse]:
-    docs = agent.documents.list_documents(category)
+    docs = get_agent().documents.list_documents(category)
     return [doc.to_dict() for doc in docs]
 
 
@@ -1004,4 +993,4 @@ async def update_tool_credentials(
 
 @app.get("/status", response_model=StatusResponse)
 async def status() -> StatusResponse:
-    return StatusResponse(**agent.get_status())
+    return StatusResponse(**get_agent().get_status())

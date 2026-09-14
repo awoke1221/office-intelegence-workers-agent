@@ -4,7 +4,8 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn backend_api:app --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+    startCommand: gunicorn office_intelligence.api:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
@@ -12,3 +13,5 @@ services:
         value: "*"
       - key: LLM_PROVIDER
         value: mock
+      - key: PYTHONUNBUFFERED
+        value: "1"

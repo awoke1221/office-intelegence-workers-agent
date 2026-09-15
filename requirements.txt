@@ -1,6 +1,7 @@
 pandas
 openpyxl
 python-docx
+python-pptx
 pillow
 scikit-learn
 pytesseract

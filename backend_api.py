@@ -234,6 +234,100 @@ class AgentExecutionResponse(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _resolve_uploaded_agent_input(
+    file_path: Optional[str],
+    table_csv: Optional[str],
+    table_json: Optional[List[Dict[str, Any]]],
+) -> tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Convert uploaded tabular files into the inputs specialist agents consume."""
+    if table_csv is not None or table_json is not None or not file_path:
+        return table_csv, table_json, None
+
+    requested_path = Path(file_path)
+    resolved_path = requested_path if requested_path.is_absolute() else UPLOAD_DIR / requested_path
+    resolved_path = resolved_path.resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in resolved_path.parents and resolved_path != upload_root:
+        raise HTTPException(status_code=403, detail="Uploaded file path is outside the upload directory.")
+    if not resolved_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Uploaded file not found: {file_path}")
+
+    suffix = resolved_path.suffix.lower()
+    if suffix in {".csv", ".txt", ".log", ".vtt", ".mbox"}:
+        return resolved_path.read_text(encoding="utf-8-sig", errors="replace"), None, str(resolved_path)
+    if suffix == ".json":
+        try:
+            value = json.loads(resolved_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON file: {file_path}") from exc
+        if isinstance(value, list) and all(isinstance(row, dict) for row in value):
+            return None, value, str(resolved_path)
+        return None, [{"value": value}], str(resolved_path)
+    if suffix in {".xlsx", ".xls"}:
+        try:
+            import pandas as pd
+
+            frame = pd.read_excel(resolved_path)
+            return None, frame.where(frame.notna(), None).to_dict(orient="records"), str(resolved_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to read spreadsheet: {file_path}") from exc
+
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(resolved_path))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            return None, [{
+                "filename": resolved_path.name,
+                "page_count": len(reader.pages),
+                "text_content": text,
+                "tables_found": 0,
+                "file_size": resolved_path.stat().st_size,
+            }], str(resolved_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to read PDF: {file_path}") from exc
+
+    if suffix in {".png", ".jpg", ".jpeg"}:
+        try:
+            from PIL import Image
+
+            with Image.open(resolved_path) as image:
+                return None, [{
+                    "filename": resolved_path.name,
+                    "file_size": resolved_path.stat().st_size,
+                    "width": image.width,
+                    "height": image.height,
+                    "format": image.format or suffix.removeprefix("."),
+                    "color_space": image.mode,
+                }], str(resolved_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to read image: {file_path}") from exc
+
+    if suffix == ".pptx":
+        try:
+            from pptx import Presentation
+
+            presentation = Presentation(str(resolved_path))
+            rows = []
+            for index, slide in enumerate(presentation.slides, start=1):
+                text_content = "\n".join(
+                    shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text
+                )
+                rows.append({
+                    "presentation_name": resolved_path.name,
+                    "slide_number": index,
+                    "slide_count": len(presentation.slides),
+                    "text_content": text_content,
+                    "speaker_notes": "",
+                })
+            return None, rows, str(resolved_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to read PowerPoint file: {file_path}") from exc
+
+    return None, None, str(resolved_path)
+
+
 app = FastAPI(title="Microfinance Worker Agent API", version="1.0.0")
 allowed_origins = [
     origin.strip()
@@ -256,7 +350,7 @@ async def authenticate_service_request(request: Request, call_next):
     started_at = time.perf_counter()
     caller = "anonymous"
 
-    if request.url.path != "/health":
+    if request.url.path not in {"/health", "/health/live", "/health/ready"}:
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
             logger.warning("office_request_denied method=%s path=%s reason=missing_bearer", request.method, request.url.path)
@@ -288,6 +382,26 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/health/live")
+async def health_live() -> Dict[str, str]:
+    return {"status": "ok", "service": "office-intelligence", "check": "liveness"}
+
+
+@app.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    """Report whether required production configuration is available."""
+    checks = {
+        "shared_secret": bool(os.environ.get("OFFICE_INTELLIGENCE_SHARED_SECRET")),
+        "allowed_origins": bool(allowed_origins) and "*" not in allowed_origins,
+        "llm_provider": os.environ.get("LLM_PROVIDER", "deepseek").lower() != "mock",
+    }
+    ready = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query_agent(payload: QueryRequest) -> QueryResponse:
     if not payload.prompt or not payload.prompt.strip():
@@ -310,11 +424,26 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
     if not payload.prompt or not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
 
+    resolved_csv, resolved_json, resolved_path = _resolve_uploaded_agent_input(
+        payload.file_path,
+        payload.table_csv,
+        payload.table_json,
+    )
+    payload = payload.model_copy(
+        update={
+            "table_csv": resolved_csv,
+            "table_json": resolved_json,
+            "file_path": resolved_path or payload.file_path,
+        }
+    )
+
     answer = ""
     metadata: Dict[str, Any] = {
         "agent_id": payload.agent_id,
         "mode": payload.mode,
     }
+    if resolved_path:
+        metadata["input_file"] = Path(resolved_path).name
 
     try:
         if payload.agent_id == "csv-analyst":
@@ -692,6 +821,21 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
                 "query": query_result.query,
                 "chunks": [chunk.to_dict() for chunk in query_result.chunks],
             })
+    except ConfirmationRequiredError as exc:
+        logger.info(
+            "Agent execution requires confirmation for %s: %s",
+            payload.agent_id,
+            exc.irreversible_tools,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "confirmation_required",
+                "message": str(exc),
+                "irreversible_tools": exc.irreversible_tools,
+                "agent_id": payload.agent_id,
+            },
+        ) from exc
     except Exception as exc:
         logger.error(f"Agent run failed for {payload.agent_id}: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -799,7 +943,7 @@ async def upload_file_alias(file: UploadFile = File(...)) -> Dict[str, str]:
 async def download_file(file_path: str) -> FileResponse:
     resolved_root = UPLOAD_DIR.resolve()
     requested_path = (UPLOAD_DIR / file_path).resolve()
-    if not str(requested_path).startswith(str(resolved_root)):
+    if resolved_root not in requested_path.parents and requested_path != resolved_root:
         raise HTTPException(status_code=403, detail="Forbidden file path")
     if not requested_path.exists() or not requested_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")

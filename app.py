@@ -20,8 +20,8 @@ class LazyApplication:
 			await self._handle_lifespan(receive, send)
 			return
 
-		if scope["type"] == "http" and scope["path"] == "/health":
-			body = json.dumps({"status": "ok"}).encode("utf-8")
+		if scope["type"] == "http" and scope["path"] in ("/health", "/health/live"):
+			body = json.dumps({"status": "ok", "service": "office-intelligence", "check": "liveness"}).encode("utf-8")
 			await send({
 				"type": "http.response.start",
 				"status": 200,

@@ -1,4 +1,4 @@
-# Microfinance Office Worker Agent - Detailed Architecture & File Reference
+# Office Workers Agent - Detailed Architecture & File Reference
 
 ## Table of Contents
 

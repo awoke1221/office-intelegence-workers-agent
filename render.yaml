@@ -13,7 +13,17 @@ services:
         sync: false
       - key: OFFICE_INTELLIGENCE_SHARED_SECRET
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
       - key: LLM_PROVIDER
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
         sync: false
       - key: PYTHONUNBUFFERED
         value: "1"

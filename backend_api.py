@@ -7,7 +7,7 @@ import base64
 import hashlib
 import hmac
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -69,6 +69,7 @@ from report_builder import CodeBlock, ReportSection, ReportResult as BuiltReport
 from fastapi.responses import StreamingResponse
 from tools import ToolCredentialStore
 from office_intelligence.runtime import UPLOAD_DIR, get_agent, get_langchain_executor
+from execution_contract import ExecutionMode, ExecutionStatus, create_execution_record
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -217,6 +218,8 @@ class ToolCredentialsRequest(BaseModel):
 class AgentExecutionRequest(BaseModel):
     agent_id: str
     prompt: str
+    execution_id: Optional[str] = None
+    trace_id: Optional[str] = None
     mode: Optional[str] = "auto"
     use_langchain: bool = True
     table_csv: Optional[str] = None
@@ -231,6 +234,9 @@ class AgentExecutionResponse(BaseModel):
     agent_id: str
     mode: str
     answer: str
+    execution_id: Optional[str] = None
+    trace_id: Optional[str] = None
+    status: str = "queued"
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -359,6 +365,8 @@ async def authenticate_service_request(request: Request, call_next):
             claims = _verify_service_token(auth_header[7:].strip())
             caller = str(claims.get("sub", "unknown"))
             request.state.authenticated_caller = caller
+            request.state.tenant_id = str(claims.get("tenant_id", "default"))
+            request.state.authenticated_claims = claims
         except HTTPException as exc:
             logger.warning("office_request_denied method=%s path=%s reason=%s", request.method, request.url.path, exc.detail)
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
@@ -416,7 +424,7 @@ async def query_agent(payload: QueryRequest) -> QueryResponse:
 
 
 @app.post("/agent/run", response_model=AgentExecutionResponse)
-async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
+async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentExecutionResponse:
     if not payload.agent_id or not payload.agent_id.strip():
         raise HTTPException(status_code=400, detail="agent_id is required.")
     if not is_known_agent(payload.agent_id):
@@ -438,6 +446,27 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
     )
 
     answer = ""
+    execution_record = create_execution_record(
+        tenant_id=getattr(request.state, "tenant_id", "default"),
+        user_id=getattr(request.state, "authenticated_caller", "system"),
+        agent_id=payload.agent_id,
+        mode=ExecutionMode(payload.mode or "auto"),
+        prompt=payload.prompt,
+        attachments=[resolved_path] if resolved_path else [],
+        parameters={
+            "top_k": payload.top_k,
+            "use_langchain": payload.use_langchain,
+            "confirm": payload.confirm,
+            "table_csv_present": bool(payload.table_csv),
+            "table_json_present": bool(payload.table_json),
+            "db_file": payload.db_file,
+        },
+        metadata={"source": "backend_api"},
+    )
+    if payload.execution_id:
+        execution_record.execution_id = payload.execution_id
+    if payload.trace_id:
+        execution_record.trace_id = payload.trace_id
     metadata: Dict[str, Any] = {
         "agent_id": payload.agent_id,
         "mode": payload.mode,
@@ -821,12 +850,21 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
                 "query": query_result.query,
                 "chunks": [chunk.to_dict() for chunk in query_result.chunks],
             })
+        execution_record.status = ExecutionStatus.COMPLETED
+        execution_record.output.answer = answer
+        execution_record.output.summary = answer
+        execution_record.metadata.update(metadata)
+        execution_record.updated_at = datetime.now(timezone.utc).isoformat()
+        execution_record.completed_at = execution_record.updated_at
     except ConfirmationRequiredError as exc:
         logger.info(
             "Agent execution requires confirmation for %s: %s",
             payload.agent_id,
             exc.irreversible_tools,
         )
+        execution_record.status = ExecutionStatus.WAITING_FOR_APPROVAL
+        execution_record.error = str(exc)
+        execution_record.updated_at = datetime.now(timezone.utc).isoformat()
         raise HTTPException(
             status_code=409,
             detail={
@@ -837,6 +875,10 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
             },
         ) from exc
     except Exception as exc:
+        execution_record.status = ExecutionStatus.FAILED
+        execution_record.error = str(exc)
+        execution_record.updated_at = datetime.now(timezone.utc).isoformat()
+        execution_record.completed_at = execution_record.updated_at
         logger.error(f"Agent run failed for {payload.agent_id}: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -851,6 +893,9 @@ async def run_agent(payload: AgentExecutionRequest) -> AgentExecutionResponse:
         agent_id=payload.agent_id,
         mode=payload.mode,
         answer=answer,
+        execution_id=execution_record.execution_id,
+        trace_id=execution_record.trace_id,
+        status=execution_record.status.value,
         metadata=metadata,
     )
 

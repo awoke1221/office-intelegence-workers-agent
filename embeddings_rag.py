@@ -9,6 +9,10 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from sentence_transformers import CrossEncoder
 
+from embedding_service import EmbeddingService
+from access_control import AccessContext, AccessPolicy
+from vector_store import PersistentVectorStore, VectorRecord
+
 try:
     from rank_bm25 import BM25Okapi
     _BM25_AVAILABLE = True
@@ -30,24 +34,11 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 COMPACTION_THRESHOLD = int(os.getenv("COMPACTION_THRESHOLD", "500"))
 
 
-class HuggingFaceEmbeddings:
+class HuggingFaceEmbeddings(EmbeddingService):
     """Lightweight wrapper around SentenceTransformer embeddings used in this repo."""
 
     def __init__(self, model_name: Optional[str] = None, model: Optional[SentenceTransformer] = None):
-        model_name = model_name or EMBEDDING_MODEL
-        self.model_name = model_name
-        if model is not None:
-            self.model = model
-        else:
-            self.model = SentenceTransformer(model_name)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embs = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-        return [vec.tolist() for vec in embs]
-
-    def embed_query(self, text: str) -> List[float]:
-        vecs = self.model.encode([text], convert_to_numpy=True, normalize_embeddings=True)
-        return list(vecs[0])
+        super().__init__(model_name=model_name or EMBEDDING_MODEL, model=model)
 
 
 class AdvancedRAG:
@@ -61,12 +52,24 @@ class AdvancedRAG:
         results = rag.retrieve(query)
     """
 
-    def __init__(self, llm: Any, embedding_model_name: Optional[str] = None, rerank_model: Optional[str] = None):
+    def __init__(
+        self,
+        llm: Any,
+        embedding_model_name: Optional[str] = None,
+        rerank_model: Optional[str] = None,
+        embedding_service: Optional[EmbeddingService] = None,
+        persistent_vector_store: Optional[PersistentVectorStore] = None,
+        access_policy: Optional[AccessPolicy] = None,
+    ):
         self.llm = llm
         self.embedding_model_name = embedding_model_name or EMBEDDING_MODEL
-        self._embedder = SentenceTransformer(self.embedding_model_name)
-        self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model_name, model=self._embedder)
-        self.embedding_dim = int(getattr(self._embedder, "get_sentence_embedding_dimension", lambda: EMBEDDING_DIM)()) or EMBEDDING_DIM
+        self.embedding_service = embedding_service or HuggingFaceEmbeddings(model_name=self.embedding_model_name)
+        self.embeddings = self.embedding_service
+        self.embedding_dim = self.embedding_service.dimension
+        self.persistent_vector_store = persistent_vector_store
+        self.access_policy = access_policy or AccessPolicy()
+        if self.persistent_vector_store is not None and self.persistent_vector_store.dimension != self.embedding_dim:
+            raise ValueError("Persistent vector store dimension does not match the embedding service.")
 
         # optional reranker
         self.rerank_model_name = rerank_model or RERANK_MODEL
@@ -86,7 +89,7 @@ class AdvancedRAG:
         self.bm25 = self._bm25
 
         # vector index
-        self._emb_matrix: np.ndarray = np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+        self._emb_matrix: np.ndarray = np.empty((0, self.embedding_dim), dtype=np.float32)
         self._faiss_index = None
         self.faiss_index = self._faiss_index
 
@@ -95,6 +98,7 @@ class AdvancedRAG:
         self._kg_edges: Dict[str, List[Tuple[str, str]]] = {}
 
         self._dirty_count = 0
+        self._restore_persistent_vectors()
 
     # -------------------- Document ingestion --------------------
     def add_documents(self, text_meta_pairs: List[Tuple[str, dict]]) -> None:
@@ -107,6 +111,10 @@ class AdvancedRAG:
 
         texts = [t for t, _ in text_meta_pairs]
         metas = [m for _, m in text_meta_pairs]
+        if self.persistent_vector_store is not None and self.persistent_vector_store.tenant_id is not None:
+            expected_tenant = self.persistent_vector_store.tenant_id
+            if any(meta.get("tenant_id") != expected_tenant for meta in metas):
+                raise ValueError("Document metadata tenant does not match the persistent vector store tenant.")
         new_ids = [str(m.get("doc_id", str(uuid4()))) + f"_{i}" for i, m in enumerate(metas)]
 
         # tokenization for BM25 (very simple whitespace tokenization)
@@ -120,14 +128,26 @@ class AdvancedRAG:
             self._bm25 = BM25Okapi(self._tokenized_texts)
 
         # embeddings
-        new_embs = self._embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+        new_embs = np.asarray(self.embedding_service.embed_documents(texts), dtype=np.float32)
         self._emb_matrix = np.vstack([self._emb_matrix, new_embs]) if self._emb_matrix.size else new_embs
         self._dirty_count += len(texts)
+
+        if self.persistent_vector_store is not None:
+            self.persistent_vector_store.upsert(
+                [
+                    VectorRecord(
+                        record_id=chunk_id,
+                        vector=vector.tolist(),
+                        metadata={**meta, "_embedding_text": text},
+                    )
+                    for chunk_id, vector, text, meta in zip(new_ids, new_embs, texts, metas)
+                ]
+            )
 
         # update faiss
         if _FAISS_AVAILABLE:
             if self._faiss_index is None:
-                self._faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
+                self._faiss_index = faiss.IndexFlatL2(self.embedding_dim)
                 if len(self._emb_matrix) > 0:
                     self._faiss_index.add(self._emb_matrix)
             else:
@@ -147,14 +167,45 @@ class AdvancedRAG:
         if _BM25_AVAILABLE:
             self._bm25 = BM25Okapi(self._tokenized_texts)
         if _FAISS_AVAILABLE:
-            self._faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
+            self._faiss_index = faiss.IndexFlatL2(self.embedding_dim)
             if len(self._emb_matrix) > 0:
                 self._faiss_index.add(self._emb_matrix)
         self.faiss_index = self._faiss_index
         self._dirty_count = 0
 
+    def _restore_persistent_vectors(self) -> None:
+        if self.persistent_vector_store is None:
+            return
+        records = self.persistent_vector_store.repository.list_records()
+        if not records:
+            return
+        restored = []
+        for record in records:
+            metadata = dict(record.metadata)
+            text = metadata.pop("_embedding_text", None)
+            if not isinstance(text, str) or not text:
+                continue
+            restored.append((record.record_id, text, metadata, record.vector))
+        if not restored:
+            return
+        self._chunk_ids = [item[0] for item in restored]
+        self._texts = [item[1] for item in restored]
+        self._metas = [item[2] for item in restored]
+        self._tokenized_texts = [self._simple_tokenize(text) for text in self._texts]
+        if _BM25_AVAILABLE:
+            self._bm25 = BM25Okapi(self._tokenized_texts)
+            self.bm25 = self._bm25
+        self._emb_matrix = np.asarray([item[3] for item in restored], dtype=np.float32)
+        self.compact()
+
     # -------------------- Hybrid search --------------------
-    def hybrid_search(self, query: str, top_k: int = 20, metadata_filter: Optional[dict] = None) -> List[dict]:
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 20,
+        metadata_filter: Optional[dict] = None,
+        access_context: Optional[AccessContext] = None,
+    ) -> List[dict]:
         """Combine BM25 + vector search results, deduplicate, and return candidates.
 
         Returns list of dicts: {'text','meta','chunk_id','score'}
@@ -173,7 +224,7 @@ class AdvancedRAG:
 
         # Vector search
         if len(self._texts) > 0:
-            q_emb = self._embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+            q_emb = np.asarray([self.embedding_service.embed_query(query)], dtype=np.float32)
             if _FAISS_AVAILABLE and self._faiss_index is not None:
                 search_k = min(max(top_k * 3, 50), len(self._texts))
                 distances, indices = self._faiss_index.search(q_emb, search_k)
@@ -203,6 +254,12 @@ class AdvancedRAG:
         # metadata filter
         if metadata_filter:
             candidates = {k: v for k, v in candidates.items() if all(v["meta"].get(kk) == vv for kk, vv in metadata_filter.items())}
+        if access_context is not None:
+            candidates = {
+                key: value
+                for key, value in candidates.items()
+                if self.access_policy.can_access(value["meta"], access_context)
+            }
 
         # return top_k sorted by score
         sorted_cands = sorted(candidates.values(), key=lambda x: x["score"], reverse=True)
@@ -225,8 +282,8 @@ class AdvancedRAG:
 
         if not scores:
             # fallback to embedding dot-product
-            q_emb = self._embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-            doc_embs = self._embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+            q_emb = np.asarray([self.embedding_service.embed_query(query)], dtype=np.float32)
+            doc_embs = np.asarray(self.embedding_service.embed_documents(texts), dtype=np.float32)
             sims = (doc_embs @ q_emb.T).flatten()
             scores = [float(s) for s in sims]
 
@@ -271,8 +328,8 @@ class AdvancedRAG:
         if not sents:
             return text
 
-        q_emb = self._embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-        sent_embs = self._embedder.encode(sents, convert_to_numpy=True, normalize_embeddings=True)
+        q_emb = np.asarray([self.embedding_service.embed_query(query)], dtype=np.float32)
+        sent_embs = np.asarray(self.embedding_service.embed_documents(sents), dtype=np.float32)
         sims = (sent_embs @ q_emb.T).flatten()
         top_idx = np.argsort(sims)[::-1][:max_sentences]
         selected = [sents[i] for i in top_idx]
@@ -344,7 +401,13 @@ class AdvancedRAG:
         return False
 
     # -------------------- High-level retrieval --------------------
-    def retrieve(self, query: str, top_k: int = 5, use_self_rag: bool = True) -> dict:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        use_self_rag: bool = True,
+        access_context: Optional[AccessContext] = None,
+    ) -> dict:
         """Main retrieval entry point implementing decomposition, hybrid search, reranking, compression, and KG traversal."""
         result = {"query": query, "items": [], "subqueries": [], "kg_edges": []}
 
@@ -362,7 +425,7 @@ class AdvancedRAG:
 
         all_candidates = []
         for sq in subqs:
-            cands = self.hybrid_search(sq, top_k=20)
+            cands = self.hybrid_search(sq, top_k=20, access_context=access_context)
             reranked = self.rerank(sq, cands, top_k=5)
             # compress
             compressed = []

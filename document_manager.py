@@ -11,6 +11,7 @@ scope.
 from __future__ import annotations
 
 import logging
+import hashlib
 import mimetypes
 import re
 import tempfile
@@ -196,6 +197,92 @@ class Chunk:
             self.metadata = {}
 
 
+@dataclass
+class FinalizedChunk:
+    """Embedding-ready text plus the finalized chunk metadata."""
+
+    content: str
+    embedding_text: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ChunkFinalizationLayer:
+    """Validate, normalize, deduplicate, and prepare chunks for embedding."""
+
+    def finalize(
+        self,
+        chunks: Sequence[Chunk],
+        *,
+        document: Optional[Dict[str, Any]] = None,
+        config: Optional[ProcessingConfig] = None,
+    ) -> List[FinalizedChunk]:
+        config = config or ProcessingConfig()
+        document = document or {}
+        finalized: List[FinalizedChunk] = []
+        seen_hashes: set[str] = set()
+
+        for source_index, chunk in enumerate(chunks):
+            if not isinstance(chunk, Chunk):
+                raise InvalidChunkError(
+                    "Chunk finalization requires Chunk instances.",
+                    document=document.get("document_id"),
+                    stage="chunk_validation",
+                )
+
+            normalized_content = self._normalize_content(chunk.content)
+            if not normalized_content:
+                raise InvalidChunkError(
+                    "Chunk content cannot be empty after normalization.",
+                    document=document.get("document_id"),
+                    stage="chunk_validation",
+                )
+            if len(normalized_content) > config.max_chunk_size:
+                raise InvalidChunkError(
+                    f"Chunk exceeds the configured maximum size of {config.max_chunk_size} characters.",
+                    document=document.get("document_id"),
+                    stage="chunk_validation",
+                )
+
+            content_hash = hashlib.sha256(normalized_content.casefold().encode("utf-8")).hexdigest()
+            if config.deduplication_behavior != "disabled" and content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+
+            metadata = dict(chunk.metadata or {})
+            embedding_text = self._prepare_embedding_text(normalized_content, metadata)
+            metadata.update(
+                {
+                    "chunk_index": len(finalized),
+                    "source_chunk_index": source_index,
+                    "chunk_id": metadata.get("chunk_id") or f"{document.get('document_id', 'document')}:chunk:{len(finalized)}",
+                    "document_id": metadata.get("document_id") or document.get("document_id"),
+                    "content_hash": content_hash,
+                    "embedding_text": embedding_text,
+                    "finalization_status": "ready",
+                    "finalization_version": 1,
+                    "character_count": len(normalized_content),
+                    "token_count": estimate_token_count(embedding_text, config.tokenizer_name),
+                    "finalized_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            finalized.append(FinalizedChunk(normalized_content, embedding_text, metadata))
+
+        return finalized
+
+    def _normalize_content(self, content: Any) -> str:
+        if not isinstance(content, str):
+            raise InvalidChunkError("Chunk content must be text.", stage="chunk_normalization")
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in content.replace("\x00", "").splitlines()]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+    def _prepare_embedding_text(self, content: str, metadata: Dict[str, Any]) -> str:
+        heading_path = metadata.get("heading_path") or []
+        heading = " > ".join(str(item).strip() for item in heading_path if str(item).strip())
+        if heading and not content.casefold().startswith(heading.casefold()):
+            return f"{heading}\n\n{content}"
+        return content
+
+
 def safe_text(value: Any) -> str:
     if value is None:
         return ""
@@ -221,6 +308,46 @@ def estimate_token_count(text: str, model_name: Optional[str] = None) -> int:
         words = re.findall(r"\S+", text)
         return max(1, int(len(words) * 1.3))
     return max(1, len(re.findall(r"\S+", text)))
+
+
+def build_document_hierarchy(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach explicit page and section relationships to a normalized document."""
+    pages = document.get("pages") or []
+    sections: List[Dict[str, Any]] = []
+    hierarchy_pages: List[Dict[str, Any]] = []
+
+    for page in pages:
+        page_number = page.get("page_number")
+        section_by_path: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        page_sections: List[Dict[str, Any]] = []
+        for block in page.get("blocks") or []:
+            heading_path = tuple(block.get("heading_path") or ())
+            section_key = heading_path or ("Unsectioned",)
+            section = section_by_path.get(section_key)
+            if section is None:
+                section_id = f"{document.get('document_id', 'document')}:page:{page_number}:section:{len(page_sections)}"
+                section = {
+                    "section_id": section_id,
+                    "title": section_key[-1],
+                    "heading_path": list(heading_path),
+                    "page_number": page_number,
+                    "blocks": [],
+                }
+                section_by_path[section_key] = section
+                page_sections.append(section)
+                sections.append(section)
+
+            block["document_id"] = document.get("document_id")
+            block["page_number"] = page_number
+            block["section_id"] = section["section_id"]
+            section["blocks"].append(block)
+
+        page["sections"] = page_sections
+        hierarchy_pages.append({"page_number": page_number, "sections": page_sections})
+
+    document["sections"] = sections
+    document["hierarchy"] = {"document_id": document.get("document_id"), "pages": hierarchy_pages}
+    return document
 
 
 class DocumentLoader:
@@ -476,6 +603,8 @@ class DOCXParser(BaseDocumentParser):
                         heading_stack.pop()
                     heading_stack.append(text)
                 block_type = "heading"
+            elif style_name.lower().startswith("list "):
+                block_type = "list"
             else:
                 block_type = "paragraph"
 
@@ -709,7 +838,7 @@ class ParserRouter:
 
     def parse(self, loaded_document: LoadedDocument, config: Optional[ProcessingConfig] = None) -> Dict[str, Any]:
         parser = self.select_parser(loaded_document)
-        return parser.parse(loaded_document, config)
+        return build_document_hierarchy(parser.parse(loaded_document, config))
 
 
 class FixedSizeChunkingStrategy:
@@ -1108,16 +1237,19 @@ class DocumentProcessor:
         loader: Optional[DocumentLoader] = None,
         router: Optional[ParserRouter] = None,
         chunking_engine: Optional[ChunkingEngine] = None,
+        finalization_layer: Optional[ChunkFinalizationLayer] = None,
     ) -> None:
         self.loader = loader or DocumentLoader()
         self.router = router or ParserRouter()
         self.chunking_engine = chunking_engine or ChunkingEngine()
+        self.finalization_layer = finalization_layer or ChunkFinalizationLayer()
 
-    def process(self, file_path: Union[str, Path], *, config: Optional[ProcessingConfig] = None) -> Tuple[Dict[str, Any], List[Chunk]]:
+    def process(self, file_path: Union[str, Path], *, config: Optional[ProcessingConfig] = None) -> Tuple[Dict[str, Any], List[FinalizedChunk]]:
         config = config or ProcessingConfig()
         loaded_document = self.loader.load(file_path)
         normalized_document = self.router.parse(loaded_document, config)
-        chunks = self.chunking_engine.chunk(normalized_document, config)
+        raw_chunks = self.chunking_engine.chunk(normalized_document, config)
+        chunks = self.finalization_layer.finalize(raw_chunks, document=normalized_document, config=config)
         return normalized_document, chunks
 
 
@@ -1161,11 +1293,17 @@ class DocumentManager:
         loader: Optional[DocumentLoader] = None,
         router: Optional[ParserRouter] = None,
         chunking_engine: Optional[ChunkingEngine] = None,
+        finalization_layer: Optional[ChunkFinalizationLayer] = None,
     ) -> None:
         self.rag = rag
         self.supabase_client = supabase_client
         self.documents: Dict[str, DocumentAsset] = {}
-        self.processor = DocumentProcessor(loader=loader, router=router, chunking_engine=chunking_engine)
+        self.processor = DocumentProcessor(
+            loader=loader,
+            router=router,
+            chunking_engine=chunking_engine,
+            finalization_layer=finalization_layer,
+        )
         self.supported_formats = self.SUPPORTED_FORMATS.copy()
 
     def ingest(
@@ -1184,7 +1322,8 @@ class DocumentManager:
 
         loaded_document = self.processor.loader.load(file_path)
         normalized_document = self.processor.router.parse(loaded_document, processing_config)
-        chunks = self.processor.chunking_engine.chunk(normalized_document, processing_config)
+        raw_chunks = self.processor.chunking_engine.chunk(normalized_document, processing_config)
+        chunks = self.processor.finalization_layer.finalize(raw_chunks, document=normalized_document, config=processing_config)
         if not chunks:
             raise ChunkingFailureError("The document did not produce any valid chunks.", document=str(loaded_document.path), stage="chunking")
 
@@ -1218,7 +1357,7 @@ class DocumentManager:
                 "source_location": chunk.metadata.get("source_location", {}),
                 **{k: v for k, v in metadata.items() if k not in {"category", "priority", "due_date", "user_goal"}},
             }
-            rag_documents.append((chunk.content, chunk_meta))
+            rag_documents.append((chunk.embedding_text, chunk_meta))
 
         if self.rag is not None and hasattr(self.rag, "add_documents"):
             try:
@@ -1260,6 +1399,8 @@ __all__ = [
     "DocumentAsset",
     "ProcessingConfig",
     "Chunk",
+    "FinalizedChunk",
+    "ChunkFinalizationLayer",
     "FixedSizeChunkingStrategy",
     "StructureAwareChunkingStrategy",
     "SentenceAwareChunkingStrategy",

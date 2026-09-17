@@ -1,5 +1,6 @@
 from document_manager import (
     Chunk,
+    ChunkFinalizationLayer,
     DocumentLoader,
     DocumentManager,
     FixedSizeChunkingStrategy,
@@ -9,6 +10,7 @@ from document_manager import (
     SentenceAwareChunkingStrategy,
     StructureAwareChunkingStrategy,
     TableAwareChunkingStrategy,
+    InvalidChunkError,
 )
 
 
@@ -184,3 +186,77 @@ def test_adaptive_chunking_profile_selects_the_right_strategy():
     assert structured_chunks
     assert table_chunks
     assert all(chunk.metadata.get("chunking_strategy") in {"structure_aware", "table_aware"} for chunk in structured_chunks + table_chunks)
+
+
+def test_docx_preserves_page_section_content_relationships(tmp_path):
+    from docx import Document as WordDocument
+
+    file_path = tmp_path / "employee_benefits.docx"
+    source = WordDocument()
+    source.add_heading("Employee Benefits", level=1)
+    source.add_paragraph("Employees receive health coverage.")
+    source.add_paragraph("Medical coverage", style="List Bullet")
+    source.add_table(rows=2, cols=2)
+    source.tables[0].rows[0].cells[0].text = "Benefit"
+    source.tables[0].rows[0].cells[1].text = "Eligibility"
+    source.tables[0].rows[1].cells[0].text = "Health"
+    source.tables[0].rows[1].cells[1].text = "All employees"
+    source.save(file_path)
+
+    document, _ = DocumentManager().processor.process(file_path)
+
+    assert document["pages"]
+    page = document["pages"][0]
+    assert page["page_number"] == 1
+    section = next(item for item in document["sections"] if item["title"] == "Employee Benefits")
+    assert section["page_number"] == 1
+    assert [item["block_type"] for item in section["blocks"]] == ["heading", "paragraph", "list", "table"]
+    assert section["blocks"][1]["heading_path"] == ["Employee Benefits"]
+    assert section["blocks"][2]["heading_path"] == ["Employee Benefits"]
+    assert section["blocks"][3]["heading_path"] == ["Employee Benefits"]
+
+
+def test_chunk_finalization_normalizes_deduplicates_and_prepares_embedding_text():
+    chunks = [
+        Chunk(
+            "  Employee   Benefits\n\nHealth coverage is available.  ",
+            {"heading_path": ["Employee Benefits"], "source_location": {"page": 3}},
+        ),
+        Chunk(
+            "Employee Benefits\n\nHealth coverage is available.",
+            {"heading_path": ["Employee Benefits"], "source_location": {"page": 3}},
+        ),
+        Chunk("Retirement contributions are available.", {"heading_path": ["Employee Benefits"]}),
+    ]
+
+    finalized = ChunkFinalizationLayer().finalize(
+        chunks,
+        document={"document_id": "doc-finalize", "document_type": "docx"},
+        config=ProcessingConfig(chunk_size=200, max_chunk_size=200, deduplication_behavior="safe"),
+    )
+
+    assert len(finalized) == 2
+    assert finalized[0].content == "Employee Benefits\n\nHealth coverage is available."
+    assert finalized[0].embedding_text == finalized[0].content
+    assert finalized[0].metadata["finalization_status"] == "ready"
+    assert finalized[0].metadata["document_id"] == "doc-finalize"
+    assert finalized[0].metadata["chunk_index"] == 0
+    assert finalized[0].metadata["content_hash"]
+    assert finalized[0].metadata["embedding_text"] == finalized[0].embedding_text
+    assert finalized[1].metadata["chunk_index"] == 1
+
+
+def test_chunk_finalization_rejects_empty_and_oversized_chunks():
+    finalizer = ChunkFinalizationLayer()
+
+    try:
+        finalizer.finalize([Chunk("   ")])
+        assert False, "empty normalized content should fail"
+    except InvalidChunkError:
+        pass
+
+    try:
+        finalizer.finalize([Chunk("too long")], config=ProcessingConfig(chunk_size=3, max_chunk_size=3))
+        assert False, "oversized content should fail"
+    except InvalidChunkError:
+        pass

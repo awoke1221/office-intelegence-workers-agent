@@ -16,6 +16,7 @@ transformers
 openai
 python-dotenv
 fastapi
+python-multipart
 a2wsgi
 uvicorn
 gunicorn

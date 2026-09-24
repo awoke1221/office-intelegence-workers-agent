@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from a2wsgi import ASGIMiddleware
@@ -20,11 +21,24 @@ class LazyApplication:
 			await self._handle_lifespan(receive, send)
 			return
 
-		if scope["type"] == "http" and scope["path"] in ("/health", "/health/live"):
-			body = json.dumps({"status": "ok", "service": "office-intelligence", "check": "liveness"}).encode("utf-8")
+		path = scope.get("path", "")
+		if isinstance(path, bytes):
+			path = path.decode("utf-8", errors="replace")
+
+		if scope["type"] == "http" and path in ("/health", "/health/live", "/health/ready"):
+			checks = {
+				"shared_secret": bool(os.environ.get("OFFICE_INTELLIGENCE_SHARED_SECRET")),
+				"allowed_origins": bool(os.environ.get("OFFICE_INTELLIGENCE_ALLOWED_ORIGINS")),
+				"llm_provider": os.environ.get("LLM_PROVIDER", "deepseek").lower() != "mock",
+			}
+			ready = all(checks.values())
+			payload = {"status": "ready" if ready else "not_ready", "service": "office-intelligence", "check": "readiness", "checks": checks}
+			if path != "/health/ready":
+				payload = {"status": "ok", "service": "office-intelligence", "check": "liveness"}
+			body = json.dumps(payload).encode("utf-8")
 			await send({
 				"type": "http.response.start",
-				"status": 200,
+				"status": 200 if path != "/health/ready" or ready else 503,
 				"headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("ascii"))],
 			})
 			await send({"type": "http.response.body", "body": body})

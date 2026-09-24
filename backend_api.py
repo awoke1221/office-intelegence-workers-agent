@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -950,7 +951,9 @@ async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
-    file_name = Path(file.filename).name
+    original_name = Path(file.filename).name
+    suffix = Path(original_name).suffix.lower()
+    file_name = f"{uuid.uuid4().hex}{suffix}"
     file_path = UPLOAD_DIR / file_name
     
     contents = await file.read()
@@ -961,7 +964,7 @@ async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
         raise HTTPException(status_code=413, detail=f"File exceeds maximum size of 10 MB.")
     
     # Extension validation for data files
-    ext = Path(file_name).suffix.lower()
+    ext = suffix
     ALLOWED_EXT = {".db", ".sqlite", ".sqlite3", ".csv", ".xlsx", ".xls", ".json", ".docx", ".doc", ".pdf"}
     if ext not in ALLOWED_EXT:
         raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}. Allowed: {ALLOWED_EXT}")
@@ -970,6 +973,7 @@ async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
     return {
         "file_path": file_name,
         "absolute_path": str(file_path),
+        "original_name": original_name,
         "message": f"File uploaded successfully"
     }
 

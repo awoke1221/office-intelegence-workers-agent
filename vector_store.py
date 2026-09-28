@@ -39,6 +39,210 @@ class VectorRecord:
     metadata: Dict[str, Any]
 
 
+class PGVectorStore:
+    """Postgres+pgvector adapter compatible with the repository interface.
+
+    This implementation avoids depending on a specific SQLAlchemy layer and works with
+    a psycopg/psycopg2 connection object while preserving the tenant-aware metadata
+    filtering semantics used elsewhere in the project.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        *,
+        table_name: str = "office_chunks",
+        model_name: str,
+        dimension: int,
+        tenant_id: Optional[str] = None,
+        metrics: Optional[EmbeddingMetrics] = None,
+        event_logger: Optional[StructuredEventLogger] = None,
+    ) -> None:
+        if connection is None:
+            raise VectorStoreError("pgvector database connection is required; pass a live psycopg/psycopg2 connection.")
+        if dimension <= 0:
+            raise ValueError("dimension must be greater than zero")
+
+        self.connection = connection
+        self.table_name = table_name
+        self.model_name = model_name
+        self.dimension = dimension
+        self.tenant_id = tenant_id
+        self.metrics = metrics or EmbeddingMetrics()
+        self.event_logger = event_logger or StructuredEventLogger()
+        self._ensure_vector_extension()
+        self._ensure_table()
+
+    @property
+    def record_ids(self) -> List[str]:
+        return [record.record_id for record in self.list_records()]
+
+    def upsert(self, records: Sequence[VectorRecord]) -> Dict[str, Any]:
+        if not records:
+            return {"count": 0, "table": self.table_name, "tenant_id": self.tenant_id}
+        prepared = []
+        for record in records:
+            self._validate_record(record)
+            prepared.append(
+                (
+                    record.record_id,
+                    list(record.vector),
+                    json.dumps(record.metadata, separators=(",", ":")),
+                    record.metadata.get("tenant_id"),
+                )
+            )
+
+        self.connection.execute(
+            f"""
+            INSERT INTO {self.table_name} (record_id, embedding, metadata_json, tenant_id, model_name, dimension, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (record_id) DO UPDATE SET
+                embedding = EXCLUDED.embedding,
+                metadata_json = EXCLUDED.metadata_json,
+                tenant_id = EXCLUDED.tenant_id,
+                model_name = EXCLUDED.model_name,
+                dimension = EXCLUDED.dimension,
+                updated_at = NOW()
+            """,
+            [
+                (record.record_id, list(record.vector), json.dumps(record.metadata, separators=(",", ":")), record.metadata.get("tenant_id"), self.model_name, self.dimension)
+                for record in records
+            ],
+        )
+        self.connection.commit()
+        self.metrics.increment("vector_records_upserted", len(records))
+        self.event_logger.emit("pgvector_records_upserted", count=len(records), tenant_id=self.tenant_id)
+        return {"count": len(records), "table": self.table_name, "tenant_id": self.tenant_id}
+
+    def list_records(self) -> List[VectorRecord]:
+        self.connection.execute(
+            f"SELECT record_id, embedding, metadata_json FROM {self.table_name} WHERE tenant_id = %s ORDER BY record_id",
+            (self.tenant_id,) if self.tenant_id is not None else (None,),
+        )
+        rows = self.connection.fetchall()
+        records = []
+        for record_id, embedding, metadata_json in rows:
+            metadata = json.loads(metadata_json) if isinstance(metadata_json, str) else (metadata_json or {})
+            vector = self._coerce_vector(embedding)
+            records.append(VectorRecord(record_id=record_id, vector=vector, metadata=metadata))
+        return records
+
+    def search(
+        self,
+        query_vector: Sequence[float],
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        access_context: Optional[AccessContext] = None,
+        access_policy: Optional[AccessPolicy] = None,
+    ) -> List[Tuple[str, float]]:
+        if top_k <= 0:
+            return []
+        self._validate_vector(query_vector)
+        policy = access_policy or AccessPolicy()
+
+        rows = self._fetch_candidate_rows()
+        if self.tenant_id is not None:
+            rows = [row for row in rows if row.metadata.get("tenant_id") == self.tenant_id]
+        if metadata_filter:
+            rows = [row for row in rows if all(row.metadata.get(key) == value for key, value in metadata_filter.items())]
+        if access_context is not None:
+            rows = [row for row in rows if policy.can_access(row.metadata, access_context)]
+        if not rows:
+            return []
+
+        query = np.asarray(query_vector, dtype=np.float32)
+        scores = []
+        for row in rows:
+            candidate = np.asarray(row.vector, dtype=np.float32)
+            cosine = float(np.dot(candidate, query) / max(np.linalg.norm(candidate) * np.linalg.norm(query), 1e-12))
+            scores.append((row.record_id, cosine))
+        scores.sort(key=lambda item: item[1], reverse=True)
+        return scores[:top_k]
+
+    def count(self) -> int:
+        row = self.connection.execute(f"SELECT COUNT(*) FROM {self.table_name}").fetchone()
+        return int(row[0]) if row else 0
+
+    def close(self) -> None:
+        if hasattr(self.connection, "close"):
+            self.connection.close()
+
+    def _ensure_vector_extension(self) -> None:
+        try:
+            self.connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            self.connection.commit()
+        except Exception:
+            pass
+
+    def _ensure_table(self) -> None:
+        self.connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
+                record_id TEXT PRIMARY KEY,
+                embedding VECTOR({self.dimension}),
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                tenant_id TEXT,
+                model_name TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        self.connection.commit()
+
+    def _fetch_candidate_rows(self) -> List[VectorRecord]:
+        if self.tenant_id is not None:
+            self.connection.execute(
+                f"SELECT record_id, embedding, metadata_json FROM {self.table_name} WHERE tenant_id = %s ORDER BY record_id",
+                (self.tenant_id,),
+            )
+        else:
+            self.connection.execute(f"SELECT record_id, embedding, metadata_json FROM {self.table_name} ORDER BY record_id")
+        rows = self.connection.fetchall()
+        return [
+            VectorRecord(
+                record_id=record_id,
+                vector=self._coerce_vector(embedding),
+                metadata=json.loads(metadata_json) if isinstance(metadata_json, str) else (metadata_json or {}),
+            )
+            for record_id, embedding, metadata_json in rows
+        ]
+
+    def _validate_record(self, record: VectorRecord) -> None:
+        self._validate_vector(record.vector)
+        if not record.record_id:
+            raise VectorStoreError("Vector record ID cannot be empty.")
+        if self.tenant_id is not None and record.metadata.get("tenant_id") != self.tenant_id:
+            raise VectorStoreError("Vector record tenant does not match the store tenant.")
+
+    def _validate_vector(self, vector: Sequence[float]) -> None:
+        array = np.asarray(vector)
+        if array.ndim != 1 or array.shape[0] != self.dimension:
+            raise VectorDimensionError(f"Expected vector dimension {self.dimension}, received shape {array.shape}.")
+        if not np.issubdtype(array.dtype, np.number) or not np.isfinite(array).all():
+            raise VectorStoreError("Vectors must contain only finite numeric values.")
+
+    def _coerce_vector(self, embedding: Any) -> List[float]:
+        if embedding is None:
+            return [0.0] * self.dimension
+        if isinstance(embedding, (list, tuple)):
+            return [float(value) for value in embedding]
+        if isinstance(embedding, str):
+            try:
+                values = json.loads(embedding)
+                if isinstance(values, list):
+                    return [float(value) for value in values]
+            except Exception:
+                pass
+            try:
+                return [float(value) for value in embedding.strip("[]").split(",") if value.strip()]
+            except Exception:
+                pass
+        if hasattr(embedding, "tolist"):
+            return [float(value) for value in embedding.tolist()]
+        return [float(embedding)] * self.dimension
+
+
 class SQLiteVectorRepository:
     """Durable vector records and metadata, independent of the search index."""
 
@@ -305,6 +509,7 @@ class PersistentVectorStore:
 
 __all__ = [
     "PersistentVectorStore",
+    "PGVectorStore",
     "SQLiteVectorRepository",
     "VectorRecord",
     "VectorStoreError",

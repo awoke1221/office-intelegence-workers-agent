@@ -4,7 +4,7 @@ import pytest
 from embedding_service import EmbeddingService, EmbeddingServiceError, EmbeddingValidationError
 from embedding_cache import SQLiteEmbeddingCache
 from embedding_jobs import JOB_COMPLETED, JOB_FAILED, EmbeddingBatchProcessor, SQLiteEmbeddingJobStore
-from vector_store import PersistentVectorStore, VectorDimensionError, VectorRecord, VectorStoreError
+from vector_store import PersistentVectorStore, PGVectorStore, VectorDimensionError, VectorRecord, VectorStoreError
 from access_control import AccessContext, AccessPolicy
 from embedding_observability import EmbeddingMetrics, StructuredEventLogger
 import embeddings_rag
@@ -316,3 +316,8 @@ def test_advanced_rag_restores_persistent_vectors_after_restart(monkeypatch, tmp
 
     assert second._texts == ["persistent employee benefits"]
     assert second.hybrid_search("employee", top_k=1)[0]["text"] == "persistent employee benefits"
+
+
+def test_pgvector_store_requires_database_driver_and_valid_configuration():
+    with pytest.raises(VectorStoreError, match="psycopg|pgvector|database connection"):
+        PGVectorStore(connection=None, table_name="office_chunks", model_name="test-model", dimension=3)

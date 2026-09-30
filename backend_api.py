@@ -7,10 +7,13 @@ import base64
 import hashlib
 import hmac
 import time
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import Request as URLRequest, urlopen
 
 try:
     from dotenv import load_dotenv
@@ -124,6 +127,65 @@ def _verify_service_token(token: str) -> Dict[str, Any]:
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+UPLOAD_BUCKET = "office-intelligence-uploads"
+
+
+def _max_upload_bytes() -> int:
+    configured_limit = int(os.environ.get("MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD_BYTES)))
+    if configured_limit <= 0:
+        raise RuntimeError("MAX_UPLOAD_BYTES must be greater than zero.")
+    return configured_limit
+
+
+def _download_supabase_file(file_url: str, file_name: str) -> Path:
+    configured_supabase_url = os.environ.get("SUPABASE_URL")
+    if not configured_supabase_url:
+        raise HTTPException(status_code=503, detail="Supabase storage is not configured.")
+
+    expected_url = urlsplit(configured_supabase_url)
+    signed_url = urlsplit(file_url)
+    signed_path_prefix = f"/storage/v1/object/sign/{UPLOAD_BUCKET}/"
+    if (
+        signed_url.scheme != expected_url.scheme
+        or signed_url.netloc.lower() != expected_url.netloc.lower()
+        or not signed_url.path.startswith(signed_path_prefix)
+        or not parse_qs(signed_url.query).get("token")
+    ):
+        raise HTTPException(status_code=403, detail="Invalid signed storage URL.")
+
+    safe_name = Path(file_name).name
+    suffix = Path(safe_name).suffix.lower()
+    max_bytes = _max_upload_bytes()
+    temporary_path: Optional[Path] = None
+    try:
+        with urlopen(URLRequest(file_url, method="GET"), timeout=30) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise HTTPException(status_code=413, detail="File exceeds the 100 MB upload limit.")
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=UPLOAD_DIR.resolve(), suffix=suffix, prefix="analysis-", delete=False
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                total_bytes = 0
+                while chunk := response.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise HTTPException(
+                            status_code=413, detail="File exceeds the configured upload limit."
+                        )
+                    temporary_file.write(chunk)
+                if total_bytes == 0:
+                    raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        return temporary_path
+    except Exception as exc:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        if isinstance(exc, HTTPException):
+            raise
+        logger.warning("Failed to download signed Supabase object: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not download the uploaded file.") from exc
 
 
 def serialize_datetime_objects(obj: Any) -> Any:
@@ -226,6 +288,9 @@ class AgentExecutionRequest(BaseModel):
     table_csv: Optional[str] = None
     table_json: Optional[List[Dict[str, Any]]] = None
     file_path: Optional[str] = None
+    file_url: Optional[str] = None
+    file_name: Optional[str] = None
+    file_type: Optional[str] = None
     db_file: Optional[str] = None
     top_k: Optional[int] = 5
     confirm: bool = False
@@ -433,18 +498,10 @@ async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentEx
     if not payload.prompt or not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
 
-    resolved_csv, resolved_json, resolved_path = _resolve_uploaded_agent_input(
-        payload.file_path,
-        payload.table_csv,
-        payload.table_json,
-    )
-    payload = payload.model_copy(
-        update={
-            "table_csv": resolved_csv,
-            "table_json": resolved_json,
-            "file_path": resolved_path or payload.file_path,
-        }
-    )
+    resolved_csv = payload.table_csv
+    resolved_json = payload.table_json
+    resolved_path = payload.file_path
+    downloaded_file_path: Optional[Path] = None
 
     answer = ""
     execution_record = create_execution_record(
@@ -453,7 +510,11 @@ async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentEx
         agent_id=payload.agent_id,
         mode=ExecutionMode(payload.mode or "auto"),
         prompt=payload.prompt,
-        attachments=[resolved_path] if resolved_path else [],
+        attachments=(
+            [resolved_path]
+            if resolved_path
+            else ([Path(payload.file_name).name] if payload.file_url and payload.file_name else [])
+        ),
         parameters={
             "top_k": payload.top_k,
             "use_langchain": payload.use_langchain,
@@ -472,10 +533,38 @@ async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentEx
         "agent_id": payload.agent_id,
         "mode": payload.mode,
     }
-    if resolved_path:
+    if payload.file_url and payload.file_name:
+        metadata["input_file"] = Path(payload.file_name).name
+    elif resolved_path:
         metadata["input_file"] = Path(resolved_path).name
 
     try:
+        if payload.file_url:
+            downloaded_file_path = _download_supabase_file(payload.file_url, payload.file_name or "")
+            payload = payload.model_copy(
+                update={
+                    "file_path": str(downloaded_file_path),
+                    **(
+                        {"db_file": str(downloaded_file_path)}
+                        if payload.agent_id == "sql-analyst"
+                        else {}
+                    ),
+                }
+            )
+
+        resolved_csv, resolved_json, resolved_path = _resolve_uploaded_agent_input(
+            payload.file_path,
+            payload.table_csv,
+            payload.table_json,
+        )
+        payload = payload.model_copy(
+            update={
+                "table_csv": resolved_csv,
+                "table_json": resolved_json,
+                "file_path": resolved_path or payload.file_path,
+            }
+        )
+
         if payload.agent_id == "csv-analyst":
             if not payload.table_csv:
                 raise HTTPException(status_code=400, detail="CSV data is required for csv-analyst.")
@@ -857,6 +946,12 @@ async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentEx
         execution_record.metadata.update(metadata)
         execution_record.updated_at = datetime.now(timezone.utc).isoformat()
         execution_record.completed_at = execution_record.updated_at
+    except HTTPException as exc:
+        execution_record.status = ExecutionStatus.FAILED
+        execution_record.error = str(exc.detail)
+        execution_record.updated_at = datetime.now(timezone.utc).isoformat()
+        execution_record.completed_at = execution_record.updated_at
+        raise
     except ConfirmationRequiredError as exc:
         logger.info(
             "Agent execution requires confirmation for %s: %s",
@@ -882,6 +977,12 @@ async def run_agent(request: Request, payload: AgentExecutionRequest) -> AgentEx
         execution_record.completed_at = execution_record.updated_at
         logger.error(f"Agent run failed for {payload.agent_id}: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if downloaded_file_path is not None:
+            try:
+                downloaded_file_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove temporary uploaded file: %s", exc)
 
     # Ensure answer is a string for the response model
     if not isinstance(answer, str):
@@ -913,7 +1014,7 @@ async def upload_documents(
         raise HTTPException(status_code=400, detail="No files were uploaded.")
 
     # Basic validation limits
-    MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))  # 10 MB default
+    max_upload_bytes = _max_upload_bytes()
     ALLOWED_EXT = {".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".db", ".sqlite"}
 
     ingested: List[Dict[str, Any]] = []
@@ -927,24 +1028,40 @@ async def upload_documents(
     for upload in files:
         file_name = Path(upload.filename).name
         file_path = UPLOAD_DIR / file_name
+        ext = Path(file_name).suffix.lower()
+        if ext not in ALLOWED_EXT:
+            raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
         try:
-            contents = await upload.read()
-            # Size validation
-            if len(contents) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail=f"File {file_name} exceeds maximum upload size of {MAX_UPLOAD_BYTES} bytes.")
-
-            # Extension validation
-            ext = Path(file_name).suffix.lower()
-            if ext not in ALLOWED_EXT:
-                raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
-            file_path.write_bytes(contents)
+            await _write_upload_to_path(upload, file_path, max_upload_bytes)
             asset = get_agent().ingest_file(str(file_path), metadata)
             ingested.append(asset.to_dict())
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.error(f"Failed to ingest {file_name}: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
 
     return {"ingested": ingested}
+
+
+async def _write_upload_to_path(upload: UploadFile, file_path: Path, max_bytes: int) -> int:
+    total_bytes = 0
+    try:
+        with file_path.open("wb") as destination:
+            while chunk := await upload.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the configured upload limit of {max_bytes} bytes.",
+                    )
+                destination.write(chunk)
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        return total_bytes
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
 
 
 async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
@@ -955,21 +1072,14 @@ async def _save_uploaded_file(file: UploadFile) -> Dict[str, str]:
     suffix = Path(original_name).suffix.lower()
     file_name = f"{uuid.uuid4().hex}{suffix}"
     file_path = UPLOAD_DIR / file_name
-    
-    contents = await file.read()
-    
-    # Size validation (10 MB max)
-    MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-    if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"File exceeds maximum size of 10 MB.")
-    
+
     # Extension validation for data files
     ext = suffix
     ALLOWED_EXT = {".db", ".sqlite", ".sqlite3", ".csv", ".xlsx", ".xls", ".json", ".docx", ".doc", ".pdf"}
     if ext not in ALLOWED_EXT:
         raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}. Allowed: {ALLOWED_EXT}")
-    
-    file_path.write_bytes(contents)
+
+    await _write_upload_to_path(file, file_path, _max_upload_bytes())
     return {
         "file_path": file_name,
         "absolute_path": str(file_path),

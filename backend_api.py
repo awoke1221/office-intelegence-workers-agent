@@ -127,7 +127,7 @@ def _verify_service_token(token: str) -> Dict[str, Any]:
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 UPLOAD_BUCKET = "office-intelligence-uploads"
 
 
@@ -162,7 +162,10 @@ def _download_supabase_file(file_url: str, file_name: str) -> Path:
         with urlopen(URLRequest(file_url, method="GET"), timeout=30) as response:
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
-                raise HTTPException(status_code=413, detail="File exceeds the 100 MB upload limit.")
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the configured upload limit of {max_bytes} bytes.",
+                )
 
             with tempfile.NamedTemporaryFile(
                 mode="wb", dir=UPLOAD_DIR.resolve(), suffix=suffix, prefix="analysis-", delete=False

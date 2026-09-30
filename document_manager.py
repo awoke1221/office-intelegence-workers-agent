@@ -355,7 +355,7 @@ class DocumentLoader:
 
     def __init__(
         self,
-        max_file_size_bytes: int = 100 * 1024 * 1024,
+        max_file_size_bytes: int = 50 * 1024 * 1024,
         allowed_roots: Optional[Sequence[Union[str, Path]]] = None,
     ) -> None:
         self.max_file_size_bytes = max_file_size_bytes

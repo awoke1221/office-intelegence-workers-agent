@@ -14,7 +14,7 @@ services:
       - key: OFFICE_INTELLIGENCE_SHARED_SECRET
         sync: false
       - key: MAX_UPLOAD_BYTES
-        value: "104857600"
+        value: "52428800"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY

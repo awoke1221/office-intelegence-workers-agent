@@ -28,14 +28,6 @@ AGENT_REGISTRY: Dict[str, Dict[str, str]] = {
     },
 
     # HR & People
-    "payroll-analyst": {
-        "name": "Payroll Analyst",
-        "description": "Analyze payroll data and highlight potential anomalies.",
-    },
-    "attendance-analyzer": {
-        "name": "Attendance Analyzer",
-        "description": "Process attendance exports and surface attendance issues.",
-    },
     "recruitment-analyst": {
         "name": "Recruitment Pipeline Analyst",
         "description": "Analyze recruitment funnel metrics and hiring trends.",
@@ -86,10 +78,6 @@ AGENT_REGISTRY: Dict[str, Dict[str, str]] = {
     },
 
     # Sales & Marketing
-    "sales-pipeline": {
-        "name": "Sales Pipeline Analyst",
-        "description": "Analyze sales pipeline data and forecast outcomes.",
-    },
     "leads-analyzer": {
         "name": "Leads Analyzer",
         "description": "Evaluate lead quality and conversion potential.",
@@ -97,10 +85,6 @@ AGENT_REGISTRY: Dict[str, Dict[str, str]] = {
     "campaign-performance": {
         "name": "Campaign Performance Analyst",
         "description": "Analyze campaign outcomes and identify winning tactics.",
-    },
-    "survey-analyzer": {
-        "name": "Survey & Feedback Analyzer",
-        "description": "Analyze survey responses and customer feedback patterns.",
     },
     "customer-journey": {
         "name": "Customer Journey Analyst",
